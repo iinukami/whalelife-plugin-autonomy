@@ -43,7 +43,7 @@ export async function apply(ctx: Context) {
     description: '明确结束当前自主插件唤起的这一轮。可选择 no_action（暂不行动）或 acted（说明真实行动结果）。两者都会记录发生时间与简短原因，并重置活动计时。没有事想做就正常选择 no_action；不要为了结束而制造行动。仅用于自主唤起，不用于正常用户对话。记录成功后停止本轮后续请求。',
     schema: { type: 'object', additionalProperties: false, required: ['runId','decision','reason'], properties: {
       runId: { type: 'string' }, decision: { type: 'string', enum: ['no_action','acted'] },
-      reason: { type: 'string', description: '实际决定、结果与简短原因，不要输出完整推演过程' },
+      reason: { type: 'string', description: '实际决定、投递事实与简短原因；发送失败或送达未知不等于对方不想回复，不把推测写成事实，不输出完整推演过程' },
     } },
     run: async (args: Record<string, unknown>, session) => {
       try { return { ok: true, ...await runtime.finish(args, session) }; }

@@ -189,6 +189,9 @@ test('transient motivation survives tool continuation with existing memory and d
     calls++;
     const messages = JSON.stringify(input.messages);
     assert.match(messages, /测试人格/);
+    assert.match(messages, /区分投递事实和对方态度/);
+    assert.match(messages, /发送成功也不代表对方已读/);
+    assert.match(messages, /retryAutomatically=false 只控制重试/);
     assert.match(messages, /之前交流的独特标记青柠/);
     const trigger = input.messages.filter((m: any) => JSON.stringify(m).includes('本轮ID：')).at(-1);
     assert.ok(trigger);

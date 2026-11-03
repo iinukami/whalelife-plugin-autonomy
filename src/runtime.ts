@@ -78,6 +78,16 @@ export class Autonomy {
     this.log('就绪', this.configError ?? '配置与会话意图已接入。只有启用自动唤醒后才会调度。');
   }
   private guard() { if (this.stopped || this.ctx.signal.aborted) throw Error('自主插件已停止'); }
+  private draw() {
+    const value = this.random();
+    if (!Number.isFinite(value) || value < 0 || value >= 1) throw Error('随机数必须在 [0,1) 范围内');
+    return value;
+  }
+  private planCheck(at: number) {
+    // Sample once per opportunity, independently of the wake/no-wake dice.
+    // Preserve the average frequency without aligning checks to a fixed grid.
+    this.nextCheck = at + Math.round(this.config.intervalMinutes * 60000 * (0.5 + this.draw()));
+  }
   private log(status: string, detail: string) {
     this.logs.push({ at: new Date(this.now()).toISOString(), status, detail: detail.slice(0, 300) });
     if (this.logs.length > 80) this.logs.shift();
@@ -106,7 +116,7 @@ export class Autonomy {
       this.guard();
       const enabling = next.enabled && !this.config.enabled;
       this.config = next; this.configRevision = digest(next); this.configError = null;
-      this.nextCheck = this.now() + next.intervalMinutes * 60000;
+      this.planCheck(this.now());
       if (enabling) { this.current = null; this.armedSince = this.now(); }
       // Changing a schedule or pausing new wakeups does not cancel ongoing behavior.
       for (const job of this.jobs.values()) {
@@ -224,7 +234,7 @@ export class Autonomy {
       const now = this.now();
       if (this.current !== id) {
         this.current = id; this.armedSince = now;
-        this.nextCheck = now + this.config.intervalMinutes * 60000;
+        this.planCheck(now);
       }
       // A switched-away operation may still be finishing a real tool call.
       if (this.active && this.active.session !== id) return;
@@ -241,12 +251,12 @@ export class Autonomy {
       }
       if (now < this.nextCheck) return;
       // At most one ordinary opportunity waits, even while another is running.
-      this.nextCheck = now + this.config.intervalMinutes * 60000;
+      // Resume from now after a delayed tick; never catch up missed opportunities.
+      this.planCheck(now);
       if (this.pending(id, 'random')) { this.log('已合并', '已有一次普通唤醒等待执行'); return; }
       if (sleeping(this.config, now)) { this.log('跳过', '当前时段不进行普通唤醒'); return; }
       const chance = probability(this.config, now, state.lastActivityAt);
-      const roll = this.random();
-      if (!Number.isFinite(roll) || roll < 0 || roll >= 1) throw Error('随机数必须在 [0,1) 范围内');
+      const roll = this.draw();
       if (roll >= chance) { this.log('未命中', `概率 ${(chance * 100).toFixed(1)}%，不调用模型`); return; }
       await this.begin(id, 'random', []);
     } finally { this.checking = false; }
@@ -367,7 +377,7 @@ export class Autonomy {
     }
   }
   private prompt(active: Active, run: RunRecord) {
-    return `【自主插件触发；这是系统记录的触发信息，不是任何人发来的消息】\n本轮ID：${active.id}\n触发原因：${run.trigger === 'agreement' ? '当前会话中明确约定的时间已到，请先读取并处理相应约定。' : run.trigger === 'manual' ? '用户在自主插件页面请求一次自主判断。' : '本地随机唤醒。'}\n${this.config.motivation}\n你沿用当前会话的人格、记忆和已经启用的能力。普通意图只是可选方向；没有意图也能行动。需要时使用 autonomy_intents 读取或维护意图；不把想法当成已经发生的事。对他人的约定与普通念头分开；明确放弃须有实际理由，对已经答应的事还须向对方解释。\n如果选择发消息，使用已启用的平台工具并核对可信目标与实际回执；本轮最终文字不会自动转发给任何人。不要虚构尚未安装的能力。若发送被权限或能力限制阻止，说明真实受阻原因即可；受阻本身不表示你已决定放弃约定，不必删除意图才能结束本轮。工具返回 retryAutomatically=false 或明确要求人工核对时，本轮不得再次尝试同一动作，使用相同 messageId 也算重试，更不能换 ID、改写内容或改走别的发送方式重试。不要把工具调用成功当作业务成功，只有真实成功回执才能完成相应意图；未确认的结果保留未完成。不相关且不依赖该结果的行动仍可自行判断；若只剩受阻事项，调用 autonomy_finish 说明受阻与本次决定后结束。只有工具未禁止重试、且明确指出参数校验未通过时，才按缺失字段修正一次；不要重复相同的无效调用。\n判断结束时必须调用 autonomy_finish，runId 填 ${active.id}，decision 为 no_action 或 acted，reason 写实际决定与简短理由。no_action 同样是正常的选择，不必为了结束而找事情做。调用结束工具后本轮停止；它会记录真实经历，不需要再输出助手聊天回复。`;
+    return `【自主插件触发；这是系统记录的触发信息，不是任何人发来的消息】\n本轮ID：${active.id}\n触发原因：${run.trigger === 'agreement' ? '当前会话中明确约定的时间已到，请先读取并处理相应约定。' : run.trigger === 'manual' ? '用户在自主插件页面请求一次自主判断。' : '本地随机唤醒。'}\n${this.config.motivation}\n你沿用当前会话的人格、记忆和已经启用的能力。普通意图只是可选方向；没有意图也能行动。需要时使用 autonomy_intents 读取或维护意图；不把想法当成已经发生的事。对他人的约定与普通念头分开；明确放弃须有实际理由，对已经答应的事还须向对方解释。\n如果选择发消息，使用已启用的平台工具并核对可信目标与实际回执；本轮最终文字不会自动转发给任何人。不要虚构尚未安装的能力。若发送被权限或能力限制阻止，说明真实受阻原因即可；受阻本身不表示你已决定放弃约定，不必删除意图才能结束本轮。工具返回 retryAutomatically=false 或明确要求人工核对时，本轮不得再次尝试同一动作，使用相同 messageId 也算重试，更不能换 ID、改写内容或改走别的发送方式重试。不要把工具调用成功当作业务成功，只有真实成功回执才能完成相应意图；未确认的结果保留未完成。区分投递事实和对方态度：若回执明确说明未发送或发送失败，只能记录该技术事实；若仅有 confirmed=false、delivery_failed 或超时等不完整结果，则保留送达未知，不能猜成已送达或必然未送达。retryAutomatically=false 只控制重试，不证明送达状态。发送成功也不代表对方已读；没有独立证据，不得由失败、送达未知或未回复推断对方不想理你、拒绝交流或故意冷落，历史中类似推测也不当作事实沿用。技术受阻不强制你等对方开口，不自动补发旧消息；之后仍可自行判断新的独立行动，但不能借新一轮、新 ID 或改写内容变相重发待核对的同一动作。不相关且不依赖该结果的行动仍可自行判断；若只剩受阻事项，调用 autonomy_finish 说明受阻与本次决定后结束。只有工具未禁止重试、且明确指出参数校验未通过时，才按缺失字段修正一次；不要重复相同的无效调用。\n判断结束时必须调用 autonomy_finish，runId 填 ${active.id}，decision 为 no_action 或 acted，reason 写实际决定与简短理由。no_action 同样是正常的选择，不必为了结束而找事情做。调用结束工具后本轮停止；它会记录真实经历，不需要再输出助手聊天回复。`;
   }
   async finish(args: Record<string, unknown>, session: ToolSession) {
     this.guard();

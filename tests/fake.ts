@@ -4,7 +4,7 @@ import { SessionQueue } from '../../whalelife/core/session-queue.ts';
 import { Autonomy } from '../src/runtime.ts';
 import { defaults } from '../src/config.ts';
 
-export function fake() {
+export function fake(random: () => number = () => 0.1) {
   let now = Date.parse('2026-10-31T10:00:00+08:00'), revision = 0;
   const documents = new Map<string, { revision: string; data: any }>();
   const experiences = new Map<string, ExperienceInput>();
@@ -56,7 +56,7 @@ export function fake() {
       },
     },
   } as unknown as Context;
-  const runtime = new Autonomy(ctx, { now: () => now, random: () => 0.1, timers: false });
+  const runtime = new Autonomy(ctx, { now: () => now, random, timers: false });
   return {
     ctx, runtime, documents, experiences, requests, submissions, controller,
     flush: () => setImmediate(),

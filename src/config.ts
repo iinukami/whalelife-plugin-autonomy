@@ -43,7 +43,7 @@ export function settings(input: unknown): Settings {
   const x = { ...defaults, ...stored } as Settings;
   if (x.schema !== 1) throw Error('不支持的配置版本');
   if (typeof x.enabled !== 'boolean' || !['fixed', 'adaptive'].includes(x.mode)) throw Error('唤醒开关或模式无效');
-  bounded(x.intervalMinutes, 1, 1440, '检查间隔（分钟）');
+  bounded(x.intervalMinutes, 1, 1440, '平均检查间隔（分钟）');
   bounded(x.probability, 0, 1, '基础概率');
   bounded(x.recentMinutes, 0, 10080, '近期阈值');
   bounded(x.distantMinutes, 1, 43200, '长时间阈值');
