@@ -5,24 +5,30 @@
 import type { Context, ToolSession, MemoryEvent } from 'whalelife';
 import { randomUUID } from 'node:crypto';
 import { defaults, settings, sleeping, probability, type Settings } from './config.ts';
-import { Documents, Intents, digest, text, type Intent } from './storage.ts';
+import { Documents, Intents, digest, text, iso, type Intent } from './storage.ts';
 
 export type Decision = 'no_action' | 'acted';
 export type Phase = 'queued' | 'cancelled' | 'running' | 'settling' | 'completed' | 'failed' | 'interrupted' | 'uncertain' | 'busy';
+export interface SelfWake { id: string; at: string; reason: string; createdAt: string; }
 export interface RunRecord {
-  id: string; trigger: 'random' | 'agreement' | 'manual'; phase: Phase;
+  id: string; trigger: 'random' | 'agreement' | 'manual' | 'self'; phase: Phase;
   queuedAt?: string; startedAt?: string; endedAt?: string; decision?: Decision; reason?: string;
   agreements: string[];
   inputMode?: 'transient' | 'excluded';
+  selfWake?: SelfWake;
 }
-interface State { schema: 1; lastActivityAt: number | null; runs: RunRecord[]; claims: Record<string, string>; }
+interface State {
+  schema: 1; lastActivityAt: number | null; runs: RunRecord[]; claims: Record<string, string>;
+  selfWake?: SelfWake | null; selfWakeVersion?: number;
+  selfWakeReceipts?: { key: string; hash: string }[];
+}
 const emptyState = (): State => ({ schema: 1, lastActivityAt: null, runs: [], claims: {} });
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 const agreementKey = (i: Intent) => `${i.id}:${i.dueAt}`;
 const finishedReason = (id: string) => `autonomy-finished:${id}`;
 // Human messages use 0. Timed agreements share that FIFO lane; less urgent
 // autonomous opportunities wait behind human messages and timed agreements.
-const priorities = { agreement: 0, manual: -10, random: -20 };
+const priorities = { agreement: 0, manual: -10, self: -15, random: -20 };
 interface Active {
   id: string; session: string; controller: AbortController; task: Promise<void>;
   completed: boolean; finishing: boolean; started: boolean; run: RunRecord;
@@ -138,17 +144,70 @@ export class Autonomy {
   private async state(session: string): Promise<State> {
     const { data } = await this.docs.read(session, 'activity', emptyState);
     if (data.schema !== 1 || !Array.isArray(data.runs) || typeof data.claims !== 'object' || data.claims === null) throw Error('自主活动文档格式不受支持；原数据已保留');
+    this.validateSelfWake(data);
     return data;
+  }
+  private validateSelfWake(state: State) {
+    if (state.selfWakeVersion !== undefined && (!Number.isSafeInteger(state.selfWakeVersion) || state.selfWakeVersion < 0)) throw Error('自行唤醒版本无效，原记录保留');
+    if (state.selfWakeReceipts !== undefined && (!Array.isArray(state.selfWakeReceipts) || state.selfWakeReceipts.some(r => !r || typeof r.key !== 'string' || typeof r.hash !== 'string'))) throw Error('自行唤醒操作记录无效，原记录保留');
+    if (state.selfWake) {
+      text(state.selfWake.id, '自行唤醒ID', 100); text(state.selfWake.reason, '唤醒原因', 140);
+      if (!iso(state.selfWake.at) || !iso(state.selfWake.createdAt)) throw Error('自行唤醒时间无效，原记录保留');
+    }
   }
   private async updateState(session: string, change: (state: State) => void) {
     this.guard();
     await this.docs.update(session, 'activity', emptyState, state => {
       if (state.schema !== 1 || !Array.isArray(state.runs)) throw Error('自主活动文档格式不受支持');
+      this.validateSelfWake(state);
       change(state);
       const live = new Set(['queued', 'running', 'settling']);
       let finished = state.runs.filter(r => !live.has(r.phase)).length;
       state.runs = state.runs.filter(r => live.has(r.phase) || finished-- <= 80);
     });
+  }
+  async scheduleSelfWake(session: string, args: Record<string, unknown>) {
+    this.guard();
+    const action = args.action;
+    if (!['get', 'set', 'cancel'].includes(String(action))) throw Error('action 须为 get、set 或 cancel');
+    const allowed = action === 'get' ? ['action'] : action === 'set' ? ['action','requestId','version','at','reason'] : ['action','requestId','version'];
+    if (Object.keys(args).some(k => !allowed.includes(k))) throw Error('包含不支持的参数；会话归属由当前工具会话确定');
+    const snapshot = (state: State, duplicate = false) => ({
+      enabled: this.config.enabled && this.config.allowSelfWake, automaticEnabled: this.config.enabled,
+      allowed: this.config.allowSelfWake, duringSleep: this.config.selfWakeDuringSleep,
+      timezone: this.config.timezone, sleep: structuredClone(this.config.sleep),
+      version: state.selfWakeVersion ?? 0, schedule: structuredClone(state.selfWake ?? null), duplicate,
+    });
+    if (action === 'get') return snapshot(await this.state(session));
+    const key = text(args.requestId, '操作ID', 100), hash = digest(args);
+    if (!Number.isSafeInteger(args.version) || Number(args.version) < 0) throw Error('请先 get，再传回当前 version');
+    let result!: ReturnType<typeof snapshot>;
+    await this.updateState(session, state => {
+      this.guard();
+      const receipts = state.selfWakeReceipts ?? [];
+      const previous = receipts.find(r => r.key === key);
+      if (previous) {
+        if (previous.hash !== hash) throw Error('同一操作ID不能用于不同内容');
+        result = snapshot(state, true); return;
+      }
+      if (args.version !== (state.selfWakeVersion ?? 0)) throw Error('自行唤醒安排已经变化，请重新 get 后再操作');
+      if (action === 'set') {
+        if (!this.config.allowSelfWake) throw Error('用户尚未开启“允许她安排下次唤醒”，本次未设置');
+        if (!this.config.enabled) throw Error('自动唤醒总开关已关闭，本次未设置；请由用户开启后再安排');
+        const at = iso(args.at), reason = text(args.reason, '自己的唤醒原因', 140);
+        if (!at || Date.parse(at) <= this.now()) throw Error('唤醒时间须为未来的带时区 ISO 日期时间，本次未设置');
+        if (!this.config.selfWakeDuringSleep && sleeping(this.config, Date.parse(at))) {
+          throw Error(`该时间位于用户设置的睡眠时段（${this.config.timezone}），未开启“允许自行唤醒突破睡眠时段”，本次未设置。请选择睡眠时段之外的时间；只有用户能开启此例外。`);
+        }
+        state.selfWake = { id: randomUUID(), at, reason, createdAt: new Date(this.now()).toISOString() };
+      } else state.selfWake = null;
+      state.selfWakeVersion = (state.selfWakeVersion ?? 0) + 1;
+      state.selfWakeReceipts = [...receipts, { key, hash }].slice(-100);
+      result = snapshot(state);
+    });
+    // A queued request must not execute an arrangement that was replaced/cancelled.
+    for (const job of this.jobs.values()) if (!job.started && job.session === session && job.run.trigger === 'self' && job.run.selfWake?.id !== result.schedule?.id) job.controller.abort(Error('自行唤醒安排已改期或取消'));
+    return result;
   }
   async noteActivity(session: string) {
     const at = this.now();
@@ -249,6 +308,11 @@ export class Autonomy {
         await this.begin(id, 'agreement', due);
         return;
       }
+      if (this.config.allowSelfWake && state.selfWake && Date.parse(state.selfWake.at) <= now &&
+          (this.config.selfWakeDuringSleep || !sleeping(this.config, now))) {
+        await this.begin(id, 'self', [], state.selfWake);
+        return;
+      }
       if (now < this.nextCheck) return;
       // At most one ordinary opportunity waits, even while another is running.
       // Resume from now after a delayed tick; never catch up missed opportunities.
@@ -271,14 +335,16 @@ export class Autonomy {
     return [...this.jobs.values()].find(job => job.session === session && job.run.trigger === trigger && !job.started && !job.controller.signal.aborted);
   }
   private scheduleInvalid(job: Active) {
-    return job.run.trigger !== 'manual' && (!this.config.enabled || (job.run.trigger === 'random' && sleeping(this.config, this.now())));
+    return job.run.trigger !== 'manual' && (!this.config.enabled ||
+      (job.run.trigger === 'random' && sleeping(this.config, this.now())) ||
+      (job.run.trigger === 'self' && (!this.config.allowSelfWake || (!this.config.selfWakeDuringSleep && sleeping(this.config, this.now())))));
   }
-  private begin(session: string, trigger: RunRecord['trigger'], due: Intent[]) {
-    const task = this.submissionQueue.catch(() => {}).then(() => this.submit(session, trigger, due));
+  private begin(session: string, trigger: RunRecord['trigger'], due: Intent[], selfWake?: SelfWake) {
+    const task = this.submissionQueue.catch(() => {}).then(() => this.submit(session, trigger, due, selfWake));
     this.submissionQueue = task;
     return task;
   }
-  private async submit(session: string, trigger: RunRecord['trigger'], due: Intent[]) {
+  private async submit(session: string, trigger: RunRecord['trigger'], due: Intent[], selfWake?: SelfWake) {
     this.guard();
     if (this.active && this.active.session !== session) {
       this.active.controller.abort(Error('当前会话已切换'));
@@ -287,12 +353,13 @@ export class Autonomy {
     const pending = this.pending(session, trigger);
     if (trigger !== 'agreement' && pending) return { jobId: pending.id, status: 'queued' as const, merged: true };
     const id = randomUUID(), controller = new AbortController();
-    const run: RunRecord = { id, trigger, phase: 'queued', queuedAt: new Date(this.now()).toISOString(), agreements: due.map(agreementKey), inputMode: 'transient' };
+    const run: RunRecord = { id, trigger, phase: 'queued', queuedAt: new Date(this.now()).toISOString(), agreements: due.map(agreementKey), inputMode: 'transient', ...(selfWake ? { selfWake: structuredClone(selfWake) } : {}) };
     const active: Active = { id, session, controller, completed: false, finishing: false, started: false, run, task: Promise.resolve() };
     this.jobs.set(id, active);
     try {
       if (await this.selected() !== session) throw Error('当前会话已切换');
       await this.updateState(session, state => {
+        if (trigger === 'self' && (!selfWake || state.selfWake?.id !== selfWake.id)) throw Error('自行唤醒安排已变更，本次不入队');
         state.runs.push(run);
         const liveKeys = new Set(due.map(agreementKey));
         for (const key of liveKeys) state.claims[key] = id;
@@ -317,6 +384,14 @@ export class Autonomy {
     await this.updateState(job.session, state => {
       const run = state.runs.find(r => r.id === job.id);
       if (!run) throw Error('缺少排队请求的运行记录');
+      if (job.run.trigger === 'self') {
+        if (!state.selfWake || state.selfWake.id !== job.run.selfWake?.id || Date.parse(state.selfWake.at) > this.now()) {
+          cancel('自行唤醒安排已改期或取消，排队请求失效'); throw job.controller.signal.reason;
+        }
+        // Consume atomically with admission, before any model/tool side effects.
+        // A model failure or restart must never retry this same wake automatically.
+        state.selfWake = null; state.selfWakeVersion = (state.selfWakeVersion ?? 0) + 1;
+      }
       run.phase = 'running'; run.startedAt = new Date(this.now()).toISOString();
     });
     job.controller.signal.throwIfAborted();
@@ -377,7 +452,7 @@ export class Autonomy {
     }
   }
   private prompt(active: Active, run: RunRecord) {
-    return `【自主插件触发；这是系统记录的触发信息，不是任何人发来的消息】\n本轮ID：${active.id}\n触发原因：${run.trigger === 'agreement' ? '当前会话中明确约定的时间已到，请先读取并处理相应约定。' : run.trigger === 'manual' ? '用户在自主插件页面请求一次自主判断。' : '本地随机唤醒。'}\n${this.config.motivation}\n你沿用当前会话的人格、记忆和已经启用的能力。普通意图只是可选方向；没有意图也能行动。需要时使用 autonomy_intents 读取或维护意图；不把想法当成已经发生的事。对他人的约定与普通念头分开；明确放弃须有实际理由，对已经答应的事还须向对方解释。\n如果选择发消息，使用已启用的平台工具并核对可信目标与实际回执；本轮最终文字不会自动转发给任何人。不要虚构尚未安装的能力。若发送被权限或能力限制阻止，说明真实受阻原因即可；受阻本身不表示你已决定放弃约定，不必删除意图才能结束本轮。工具返回 retryAutomatically=false 或明确要求人工核对时，本轮不得再次尝试同一动作，使用相同 messageId 也算重试，更不能换 ID、改写内容或改走别的发送方式重试。不要把工具调用成功当作业务成功，只有真实成功回执才能完成相应意图；未确认的结果保留未完成。区分投递事实和对方态度：若回执明确说明未发送或发送失败，只能记录该技术事实；若仅有 confirmed=false、delivery_failed 或超时等不完整结果，则保留送达未知，不能猜成已送达或必然未送达。retryAutomatically=false 只控制重试，不证明送达状态。发送成功也不代表对方已读；没有独立证据，不得由失败、送达未知或未回复推断对方不想理你、拒绝交流或故意冷落，历史中类似推测也不当作事实沿用。技术受阻不强制你等对方开口，不自动补发旧消息；之后仍可自行判断新的独立行动，但不能借新一轮、新 ID 或改写内容变相重发待核对的同一动作。不相关且不依赖该结果的行动仍可自行判断；若只剩受阻事项，调用 autonomy_finish 说明受阻与本次决定后结束。只有工具未禁止重试、且明确指出参数校验未通过时，才按缺失字段修正一次；不要重复相同的无效调用。\n判断结束时必须调用 autonomy_finish，runId 填 ${active.id}，decision 为 no_action 或 acted，reason 写实际决定与简短理由。no_action 同样是正常的选择，不必为了结束而找事情做。调用结束工具后本轮停止；它会记录真实经历，不需要再输出助手聊天回复。`;
+    return `【自主插件触发；这是系统记录的触发信息，不是任何人发来的消息】\n本轮ID：${active.id}\n触发原因：${run.trigger === 'agreement' ? '当前会话中明确约定的时间已到，请先读取并处理相应约定。' : run.trigger === 'self' ? '你自己安排的唤醒时间已到。安排信息：' + JSON.stringify(run.selfWake) + '。这只是重新判断的机会，可以选择不行动；不重放结果不确定的旧动作。' : run.trigger === 'manual' ? '用户在自主插件页面请求一次自主判断。' : '本地随机唤醒。'}\n${this.config.motivation}\n${this.config.allowSelfWake ? '用户允许你通过 autonomy_schedule 自行安排下一次唤醒；先 get 了解当前安排和睡眠限制。按需要设置，不必每轮安排；普通随机唤醒仍独立运行。' : '用户尚未允许你自行安排唤醒，不要宣称已经设定。'}\n你沿用当前会话的人格、记忆和已经启用的能力。普通意图只是可选方向；没有意图也能行动。需要时使用 autonomy_intents 读取或维护意图；不把想法当成已经发生的事。对他人的约定与普通念头分开；明确放弃须有实际理由，对已经答应的事还须向对方解释。\n如果选择发消息，使用已启用的平台工具并核对可信目标与实际回执；本轮最终文字不会自动转发给任何人。不要虚构尚未安装的能力。若发送被权限或能力限制阻止，说明真实受阻原因即可；受阻本身不表示你已决定放弃约定，不必删除意图才能结束本轮。工具返回 retryAutomatically=false 或明确要求人工核对时，本轮不得再次尝试同一动作，使用相同 messageId 也算重试，更不能换 ID、改写内容或改走别的发送方式重试。不要把工具调用成功当作业务成功，只有真实成功回执才能完成相应意图；未确认的结果保留未完成。区分投递事实和对方态度：若回执明确说明未发送或发送失败，只能记录该技术事实；若仅有 confirmed=false、delivery_failed 或超时等不完整结果，则保留送达未知，不能猜成已送达或必然未送达。retryAutomatically=false 只控制重试，不证明送达状态。发送成功也不代表对方已读；没有独立证据，不得由失败、送达未知或未回复推断对方不想理你、拒绝交流或故意冷落，历史中类似推测也不当作事实沿用。技术受阻不强制你等对方开口，不自动补发旧消息；之后仍可自行判断新的独立行动，但不能借新一轮、新 ID 或改写内容变相重发待核对的同一动作。不相关且不依赖该结果的行动仍可自行判断；若只剩受阻事项，调用 autonomy_finish 说明受阻与本次决定后结束。只有工具未禁止重试、且明确指出参数校验未通过时，才按缺失字段修正一次；不要重复相同的无效调用。\n判断结束时必须调用 autonomy_finish，runId 填 ${active.id}，decision 为 no_action 或 acted，reason 写实际决定与简短理由。no_action 同样是正常的选择，不必为了结束而找事情做。调用结束工具后本轮停止；它会记录真实经历，不需要再输出助手聊天回复。`;
   }
   async finish(args: Record<string, unknown>, session: ToolSession) {
     this.guard();
@@ -434,8 +509,15 @@ export class Autonomy {
     // Let submissions already accepted by this instance finish registration first.
     await this.submissionQueue.catch(() => {});
     const jobs = [...this.jobs.values()];
+    const schedules = jobs.filter(job => !job.started && job.run.selfWake);
     for (const job of jobs) job.controller.abort(Error(reason));
-    await Promise.all(jobs.map(job => job.task));
+    try {
+      for (const job of schedules) await this.updateState(job.session, state => {
+        if (state.selfWake?.id === job.run.selfWake!.id) {
+          state.selfWake = null; state.selfWakeVersion = (state.selfWakeVersion ?? 0) + 1;
+        }
+      });
+    } finally { await Promise.all(jobs.map(job => job.task)); }
   }
   async idle() {
     await this.submissionQueue.catch(() => {});
@@ -457,8 +539,9 @@ export class Autonomy {
       now: new Date(this.now()).toISOString(), nextCheckAt: this.nextCheck ? new Date(this.nextCheck).toISOString() : null,
       sleeping: sleeping(this.config, this.now()), probability: probability(this.config, this.now(), state.lastActivityAt),
       lastActivityAt: state.lastActivityAt ? new Date(state.lastActivityAt).toISOString() : null,
+      selfWake: structuredClone(state.selfWake ?? null), selfWakeVersion: state.selfWakeVersion ?? 0,
       intents: session ? await this.intents.list(session) : [], runs: [...state.runs].reverse(), logs: [...this.logs].reverse(),
-      limitations: ['与网页和渠道共用会话队列，不中断正在进行的交流；到点约定与真人消息同级，手动判断其次，普通唤醒最后。', '排队只在当前实例有效；取消、停用和重启不补发旧请求。只有当前会话参与调度。'],
+      limitations: ['与网页和渠道共用会话队列，不中断正在进行的交流；到点约定与真人消息同级，其后依次为手动、自行安排、普通随机唤醒。', '只有当前会话参与调度。自行安排在开始判断时消耗；尚未开始的安排跨重启保留，已开始的动作不会自动重放。'],
     };
   }
 }

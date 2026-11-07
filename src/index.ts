@@ -17,6 +17,21 @@ export async function apply(ctx: Context) {
     return session.id;
   };
   ctx.tools.register({
+    name: 'autonomy_schedule', danger: 'safe', origin: { platform: '自主性', action: '安排自行唤醒' },
+    description: '查看、设置或取消当前会话的下一次自行唤醒，普通交流和自主轮次都可使用。先 get 获取 version、现有安排、用户开关和睡眠规则；set/cancel 必填 requestId 和 version。set 使用未来带时区 ISO 时间 at 和自己的简短 reason，同一会话只保留一个安排，重新设置会替换原安排。用户须开启自动唤醒及自行安排开关；默认不能设在睡眠时段，只有用户开启睡眠例外才可突破，失败时向用户说明真实原因。到点唤醒不掷骰子，排队等待当前交流结束；这是再次判断的机会，行动仍由你决定，可以不行动，也不必每轮都安排。不是向用户承诺已经执行，不把普通念头伪装为对外约定。一次性安排在开始判断时消耗，之后不会因失败而重放。改期/取消须使用最新 version；同一操作重试保留 requestId。reason 仅写自己的目的，不复制临时外部正文或过期引用。不能用此工具安排盲目重发结果不确定的旧动作。',
+    schema: { type: 'object', additionalProperties: false, required: ['action'], properties: {
+      action: { type: 'string', enum: ['get','set','cancel'] },
+      requestId: { type: 'string', maxLength: 100, description: 'set/cancel 必填，当前操作的稳定ID' },
+      version: { type: 'integer', minimum: 0, description: 'set/cancel 必填，get 返回的版本号' },
+      at: { type: 'string', description: 'set 必填，未来带时区 ISO 时间，例如 2030-01-02T20:00:00+08:00' },
+      reason: { type: 'string', maxLength: 140, description: 'set 必填，自己为什么想在这个时间再醒来判断，不能复制外部资料' },
+    } },
+    run: async (args: Record<string, unknown>, session) => {
+      try { return { ok: true, ...await runtime.scheduleSelfWake(currentToolSession(session), args) }; }
+      catch (error) { return { ok: false, error: errorText(error) }; }
+    },
+  });
+  ctx.tools.register({
     name: 'autonomy_intents', danger: 'safe', origin: { platform: '自主性', action: '管理会话意图' },
     description: '读取或管理当前会话的可选意图；普通聊天也可形成意图，意图不是行动前提，也不表示行动已经发生。先 list 获取 intentId 与 version。remember 必填 requestId/kind/text/source/evidence；revise 是完整修订，另必填 intentId/version；complete 和 abandon 必填 requestId/intentId/version/reason/evidence，reason 与 evidence 是两个独立必填字段。只有与他人的明确时间约定可设 dueAt，普通打算使用 preferredAt；产生时间由程序记录。完成须有真实结果，放弃须有真实原因和依据，对已答应的事还须实际向对方解释。暂时受阻不等于完成或放弃，无需为了结束自主轮次而删除意图。参数错误时按 fields/missingFields 修正，不能只反复缩短 reason。',
     schema: { type: 'object', additionalProperties: false, required: ['action'], properties: {

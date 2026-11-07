@@ -13,6 +13,8 @@ export interface SleepWindow {
 export interface Settings {
   schema: 1;
   enabled: boolean;
+  allowSelfWake: boolean;
+  selfWakeDuringSleep: boolean;
   mode: 'fixed' | 'adaptive';
   intervalMinutes: number;
   probability: number;
@@ -25,7 +27,8 @@ export interface Settings {
   motivation: string;
 }
 export const defaults: Settings = {
-  schema: 1, enabled: false, mode: 'fixed', intervalMinutes: 30, probability: 0.2,
+  schema: 1, enabled: false, allowSelfWake: false, selfWakeDuringSleep: false,
+  mode: 'fixed', intervalMinutes: 30, probability: 0.2,
   recentMinutes: 20, recentMultiplier: 0.15, distantMinutes: 360, distantMultiplier: 1.5,
   timezone: 'Asia/Shanghai', sleep: [],
   motivation: '我现在要不要做点什么？结合当前情况、人格和记忆，自行决定。已有意图只是可选方向，没有意图也可以行动，也可以选择暂不行动。',
@@ -43,6 +46,7 @@ export function settings(input: unknown): Settings {
   const x = { ...defaults, ...stored } as Settings;
   if (x.schema !== 1) throw Error('不支持的配置版本');
   if (typeof x.enabled !== 'boolean' || !['fixed', 'adaptive'].includes(x.mode)) throw Error('唤醒开关或模式无效');
+  if (typeof x.allowSelfWake !== 'boolean' || typeof x.selfWakeDuringSleep !== 'boolean') throw Error('自行安排唤醒和睡眠例外必须是开关');
   bounded(x.intervalMinutes, 1, 1440, '平均检查间隔（分钟）');
   bounded(x.probability, 0, 1, '基础概率');
   bounded(x.recentMinutes, 0, 10080, '近期阈值');

@@ -337,7 +337,7 @@ test('settings are authenticated, reject stale writes, load executable UI and pe
   const state = await stateResponse.json();
   assert.equal(stateResponse.status, 200, JSON.stringify(state));
   assert.equal(state.config.enabled, false);
-  const config = { ...state.config, probability: 0.3, mode: 'adaptive', sleep: [
+  const config = { ...state.config, allowSelfWake: true, selfWakeDuringSleep: true, probability: 0.3, mode: 'adaptive', sleep: [
     { start: '23:00', end: '07:00', startDay: 1, endDay: 5 },
     { start: '01:00', end: '09:00', startDay: 6, endDay: 7 },
     { start: '13:00', end: '14:00' },
@@ -347,6 +347,60 @@ test('settings are authenticated, reject stale writes, load executable UI and pe
   assert.equal((await f.request('state', { action: 'wake', session: 'stale-session' })).status, 409);
   await f.app.runtime.action('autonomy', 'reload');
   assert.deepEqual((await f.service().status()).config, config);
+});
+
+test('self-wake tools persist through a real child reload and the authenticated page can cancel by version', async t => {
+  const f = await fixture(t);
+  const original = await f.service().status();
+  assert.equal((await f.request('state', { action: 'configure', revision: original.revision,
+    config: { ...original.config, enabled: true, allowSelfWake: true, probability: 0 } })).status, 200);
+  const call = async (args: unknown) => (await f.app.tools.call('autonomy_schedule', args,
+    { id: f.sessionId, permission: 'full' })).result;
+  const first = await call({ action: 'get' });
+  assert.equal(first.ok, true); assert.equal(first.version, 0); assert.equal(first.duringSleep, false);
+  const setArgs = { action: 'set', requestId: 'child-set', version: first.version,
+    at: new Date(Date.now() + 120000).toISOString(), reason: '过一会儿再决定要不要写日记' };
+  const saved = await call(setArgs);
+  assert.equal(saved.ok, true); assert.equal(saved.version, 1);
+  await f.app.runtime.action('autonomy', 'reload');
+  const reloaded = await call({ action: 'get' });
+  assert.deepEqual(reloaded.schedule, saved.schedule); assert.equal(reloaded.version, 1);
+  assert.equal((await call(setArgs)).duplicate, true);
+  assert.equal((await f.request('state', { action: 'cancelSelfWake', session: 'other', version: 1, requestId: 'wrong-session' })).status, 409);
+  assert.equal((await f.request('state', { action: 'cancelSelfWake', session: f.sessionId, version: 0, requestId: 'stale' })).status, 400);
+  assert.equal((await f.request('state', { action: 'cancelSelfWake', session: f.sessionId, version: 1, requestId: 'cancel' })).status, 200);
+  assert.equal((await call({ action: 'get' })).schedule, null);
+  assert.equal((await f.service().status()).runs.length, 0);
+});
+
+test('a real child executes a self-arranged time once with zero random probability and retains the decision', { timeout: 15000 }, async t => {
+  const f = await fixture(t); let calls = 0;
+  f.app.llm.chat = async (input: any) => {
+    calls++;
+    const messages = JSON.stringify(input.messages);
+    assert.match(messages, /你自己安排的唤醒时间已到/);
+    assert.match(messages, /看看是否想继续自己的日记/);
+    return response('autonomy_finish', { runId: /本轮ID：([a-f0-9-]+)/.exec(messages)![1],
+      decision: 'no_action', reason: '按自己的安排醒来，决定暂时不行动' });
+  };
+  const original = await f.service().status();
+  assert.equal((await f.request('state', { action: 'configure', revision: original.revision,
+    config: { ...original.config, enabled: true, allowSelfWake: true, probability: 0 } })).status, 200);
+  const result = await f.app.tools.call('autonomy_schedule', { action: 'set', version: 0, requestId: 'self-time',
+    at: new Date(Date.now() + 1200).toISOString(), reason: '看看是否想继续自己的日记' }, { id: f.sessionId, permission: 'full' });
+  assert.equal(result.result.ok, true);
+  let state;
+  for (let i = 0; i < 80; i++) {
+    state = await f.service().status();
+    if (state.runs[0]?.phase === 'completed') break;
+    await delay(100);
+  }
+  assert.equal(state.runs[0]?.phase, 'completed'); assert.equal(state.runs[0].trigger, 'self');
+  assert.equal(state.selfWake, null); assert.equal(calls, 1);
+  await f.app.runtime.action('autonomy', 'reload'); await delay(1100);
+  assert.equal(calls, 1); assert.equal((await f.service().status()).selfWake, null);
+  const memory = await f.app.memoryEngine.state(f.sessionId);
+  assert.equal(memory.records.filter((r: any) => r.text?.startsWith('自主判断结束')).length, 1);
 });
 
 test('host stop cancels the actual child in flight; reload preserves uncertainty without replaying its work', async t => {
