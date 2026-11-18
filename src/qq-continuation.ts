@@ -16,11 +16,19 @@ interface Item extends QQDeliveryRef {
   delivery: Counts; parts?: { text: string; state: 'sent' | 'not_sent' | 'unknown' }[];
 }
 type Key = { sessionId: string; deliveryId: string };
+type DraftKey = Key & { accountId: string };
+type DraftTarget = DraftKey & { userId: string };
+type DraftPart = { index: number; text: string };
+type DraftProgress = { total: number | null; sent: number | null; notSent: number | null; unknown: number | null };
+type DraftResult = { status: 'unavailable' } | (DraftTarget & { status: 'claimed'; expiresAt: string; parts: DraftPart[] });
 type Operation = Key & { expectedRevision: string };
 interface Failure { status: 'blocked'; confirmed: false; reason: string }
 interface QQStatus { state?: string; binding?: { state?: string; sessionId?: string } }
 interface QQ {
   textDeliveryApiVersion: string; textDeliveryResumeSupported: boolean;
+  temporaryDraftApiVersion?: string;
+  claimTemporaryDraft?(key: DraftKey): Promise<DraftResult>;
+  releaseTemporaryDraft?(key: DraftKey): Promise<{ status: 'released' | 'unavailable' }>;
   getSelfId?(): string | null | Promise<string | null>;
   status?(): QQStatus | Promise<QQStatus>;
   listTextDeliveries(input: { sessionId: string; limit: number; cursor?: string }): Promise<Failure | { status: 'ok'; items: Item[]; nextCursor?: string }>;
@@ -37,6 +45,17 @@ const blocked = (reason: string): Failure => ({ status: 'blocked', confirmed: fa
 const id = (s: unknown): s is string => typeof s === 'string' && s.length > 0 && s.length <= 200 && !/[\x00-\x1f\x7f]/u.test(s);
 const refKey = (ref: QQDeliveryRef) => JSON.stringify([ref.accountId, ref.deliveryId]);
 const qqAccount = (value: unknown): value is string => typeof value === 'string' && /^[1-9]\d{4,19}$/.test(value);
+const validDraftKey = (key: DraftKey) => id(key.sessionId) && qqAccount(key.accountId) && /^delivery_[a-f0-9]{64}$/.test(key.deliveryId);
+function draftProgressKnown(p: DraftProgress): p is { total: number; sent: number; notSent: number; unknown: 0 } {
+  return p.total !== null && Number.isSafeInteger(p.total) && p.total <= 64 && p.sent !== null && Number.isSafeInteger(p.sent) &&
+    p.sent >= 0 && p.notSent !== null && Number.isSafeInteger(p.notSent) && p.notSent > 0 && p.unknown === 0 && p.total === p.sent + p.notSent;
+}
+function draftCaller(session: ToolSession, target: DraftTarget) {
+  if (session.channel === 'qq') return session.origin?.plugin === 'qq' && session.account === target.accountId &&
+    session.peer === 'direct:' + target.userId && session.sender === target.userId;
+  return session.channel === 'plugin' && session.account === 'autonomy' && session.peer === target.sessionId &&
+    session.origin?.plugin === 'autonomy' && session.origin.action === '自主唤起';
+}
 type RecoveryWindow = { offlineAt: number; onlineAt: number };
 const sameRef = (a: QQDeliveryRef, b: QQDeliveryRef) => a.accountId === b.accountId && a.deliveryId === b.deliveryId;
 const abandonReasons = {
@@ -246,6 +265,49 @@ export class QqContinuation {
   }
   recoveryWindows(account: string): readonly RecoveryWindow[] {
     return this.link?.account === account ? this.link.windows : [];
+  }
+  private draftBinding() {
+    const b = this.binding;
+    if (b && !b.signal.aborted && b.service.temporaryDraftApiVersion === '1.0.0' &&
+        typeof b.service.claimTemporaryDraft === 'function' && typeof b.service.releaseTemporaryDraft === 'function' &&
+        typeof b.service.getSelfId === 'function') return b;
+  }
+  supportsTemporaryDraft(): boolean { return Boolean(this.draftBinding()); }
+  async readTemporaryDraft(session: ToolSession, target: DraftTarget, expected: DraftProgress): Promise<DraftPart[] | null> {
+    try {
+      const binding = this.draftBinding();
+      if (!binding || session.permission === 'off' || !session.transientContext || session.id !== target.sessionId || !validDraftKey(target) ||
+          !qqAccount(target.userId) || !draftCaller(session, target) || !draftProgressKnown(expected)) return null;
+      const service = binding.service;
+      const current = async () => await service.getSelfId!() === target.accountId &&
+        await this.sessionId(session, binding) === target.sessionId && this.binding === binding &&
+        !binding.signal.aborted && !session.signal?.aborted;
+      if (!await current()) return null;
+      const { sessionId, accountId, deliveryId } = target;
+      const key = { sessionId, accountId, deliveryId };
+      let result: DraftResult;
+      try { result = await service.claimTemporaryDraft!(key); }
+      finally {
+        // QQ drops the text during claim. Clear its remaining marker even if
+        // the response was lost; the transient tool owns the only returned copy.
+        if (!binding.signal.aborted) {
+          try { await service.releaseTemporaryDraft!(key); } catch { /* Marker expires at the provider. */ }
+        }
+      }
+      if (!result || result.status !== 'claimed' || result.sessionId !== sessionId || result.accountId !== accountId ||
+          result.deliveryId !== deliveryId || result.userId !== target.userId || typeof result.expiresAt !== 'string' ||
+          !Array.isArray(result.parts) || result.parts.length !== expected.notSent || !await current() ||
+          !(Date.parse(result.expiresAt) > this.now())) return null;
+      // The QQ sender processes the original plan in order and stops at the
+      // first failure. Accept precisely the unsent suffix, never confirmed text.
+      const parts: DraftPart[] = [];
+      for (const [i, part] of result.parts.entries()) {
+        if (!part || part.index !== expected.sent + i + 1 || typeof part.text !== 'string' || !part.text.length) return null;
+        parts.push({ index: part.index, text: part.text });
+      }
+      this.onRead?.(session);
+      return parts;
+    } catch { return null; }
   }
   async recoveryAccount(session: string, verify = false): Promise<string | null> {
     const binding = this.binding;

@@ -116,10 +116,10 @@ function describe(record: Stored): QqInterruption {
   const c = record.counts;
   const progress = c ? `原计划共 ${c.total} 段，平台确认发送 ${c.sent} 段，明确未发送 ${c.notSent} 段，结果未知 ${c.unknown} 段。`
     : '这次投递没有得到完整的发送确认，无法确定各段进度。';
-  const topic = record.viewedComments ? '同一次自主判断中，我刚查看过 B 站评论。具体想说什么已经无法核实。' : '';
+  const topic = record.viewedComments ? '同一次自主判断中，我刚查看过 B 站评论。' : '';
   return { at: record.at, total: c?.total ?? null, sent: c?.sent ?? null, notSent: c?.notSent ?? null,
     unknown: c?.unknown ?? null, originalAvailable: false,
-    description: `${topic}我当时给这位联系人发了一条临时 QQ 私聊。${progress}每一段的原话都未保留，包括确认发送的段。回执只确认发送进度，对方是否已读未知。之前的聊天没有标明哪句属于这些分段，不能据此引用、猜测或补写任何一段。若想接着聊，可以从此刻的新想法说起。` };
+    description: `${topic}我当时给这位联系人发了一条临时 QQ 私聊。${progress}回执没有记录分段原话，包括确认发送的段。对方是否已读未知。之前的聊天没有标明哪句属于这些分段，不能据此猜测原文。` };
 }
 
 /** Remember delivery facts through the host's public session archive. No send or wake capability. */
@@ -129,7 +129,7 @@ export class QqInterruptions {
   private cached?: { session: string; data: Ledger };
   constructor(docs: Documents, activatedAt = Date.now()) { this.docs = docs; this.activatedAt = new Date(activatedAt).toISOString(); }
   async sync(sessionId: string, runs: RunWindow[]) { await this.refresh(sessionId, runs); }
-  async recent(session: ToolSession, runs: RunWindow[]): Promise<QqInterruption | null> {
+  async recent(session: ToolSession, runs: RunWindow[]) {
     session.signal?.throwIfAborted();
     if (!session.id || session.permission === 'off' || session.channel !== 'qq' ||
         !session.account || !accountId.test(session.account) || !session.peer || !direct.test(session.peer) ||
@@ -141,7 +141,7 @@ export class QqInterruptions {
     const data = await this.refresh(session.id, runs, session.signal, noticed);
     session.signal?.throwIfAborted();
     const item = data.byRoute[route];
-    return item ? describe(item) : null;
+    return item ? { ...describe(item), deliveryId: item.delivery } : null;
   }
   private async save(session: string, revision: string | null, data: Ledger) {
     await this.docs.write(session, document, revision, data);

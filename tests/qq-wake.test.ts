@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import type { MemoryEvent } from 'whalelife';
+import type { MemoryEvent, ToolSession } from 'whalelife';
 import { fake } from './fake.ts';
 
 test('QQ can discover an unfinished reply while paused or asleep; it waits for an allowed time to ask', async t => {
@@ -47,7 +47,7 @@ test('a queued QQ judgment rechecks eligibility after the human finishes speakin
   assert.equal(f.experiences.size, 0);
 });
 
-test('a private follow-up can claim the same interruption while the reconnect judgment is queued', async t => {
+test('the original peer can read the unsent draft once and keep a thought while the reconnect judgment is queued', async t => {
   const f = fake(), account = '100001', peer = 'direct:200002', session = 'one';
   await f.initialize({ probability: 0 });
   const at = (offset: number) => new Date(f.now + offset).toISOString();
@@ -70,13 +70,39 @@ test('a private follow-up can claim the same interruption while the reconnect ju
   // The tool notification was missed. Reconnection rereads the public archive.
   for (let i = 0; i < 5 && !f.submissions.length; i++) { await f.runtime.tick(); await f.flush(); }
   assert.equal((await f.runtime.status()).queued[0]?.trigger, 'qq_interruption');
-  const query = () => f.runtime.recentInterruption({ id: session, permission: 'full', channel: 'qq', account, peer,
-    sender: '200002', origin: { plugin: 'qq' } });
-  assert.equal((await query()).items[0]?.sent, 2);
+  const incoming: ToolSession = { id: session, permission: 'full', channel: 'qq', account, peer,
+    sender: '200002', origin: { plugin: 'qq' }, transientContext: true, external_message_id: 'first-question' };
+  const draft = Array.from({ length: 6 }, (_, i) => ({ index: i + 3, text: '模拟未发原句' + (i + 3) }));
+  let reads = 0;
+  f.runtime.qq.readTemporaryDraft = async (_caller, target, progress) => {
+    assert.deepEqual(target, { sessionId: session, accountId: account, userId: '200002', deliveryId: base.delivery_id });
+    assert.deepEqual([progress.total, progress.sent, progress.notSent, progress.unknown], [8, 2, 6, 0]);
+    return ++reads === 1 ? draft : null;
+  };
+  const other = { ...incoming, peer: 'direct:200003', sender: '200003' };
+  assert.deepEqual((await f.runtime.recentInterruption(other, true)).items, []);
+  assert.equal(reads, 0);
+  const first = (await f.runtime.recentInterruption(incoming, true)).items[0];
+  assert.deepEqual(first?.parts, draft);
+  assert.equal(first.originalAvailable, true);
+  assert.equal((await f.runtime.intents.list(session)).length, 0);
+  await assert.rejects(f.runtime.rememberDraftFollowup(other));
+  await f.runtime.rememberDraftFollowup(incoming);
+  const thoughts = await f.runtime.intents.list(session);
+  assert.equal(thoughts.length, 1);
+  assert.equal(thoughts[0].kind, 'thought');
+  assert.equal(first.at, rows.at(-1)!.ts);
+  assert.ok(thoughts[0].evidence.includes(first.at));
+  assert.ok(!JSON.stringify([...f.documents.values()]).includes('模拟未发原句'));
   holder.release();
   await holder.done;
   await f.runtime.idle();
   assert.equal(f.requests.length, 0);
   assert.equal((await f.runtime.status()).runs[0].phase, 'cancelled');
-  assert.equal((await query()).items[0]?.notSent, 6);
+  const later = { ...incoming, external_message_id: 'next-question' };
+  const fact = (await f.runtime.recentInterruption(later, true)).items[0];
+  assert.deepEqual([fact.total, fact.sent, fact.notSent, fact.unknown], [8, 2, 6, 0]);
+  assert.equal(fact.originalAvailable, false);
+  assert.equal(fact.parts, undefined);
+  await assert.rejects(f.runtime.rememberDraftFollowup(later));
 });

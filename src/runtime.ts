@@ -55,12 +55,12 @@ const priorities = { agreement: 0, manual: -10, self: -15, qq_resume: -16, qq_in
 type Recovery = { accountId: string; deliveryId: string; userId: string; fact: QqInterruption };
 function interruptionPrompt(recovery?: Recovery) {
   if (!recovery) return '';
-  return `QQ 已恢复，核对一下你在 ${recovery.fact.at} 对联系人 ${recovery.userId} 说到一半的那次私聊。对方没有发来这条提示。\n${recovery.fact.description}\n现在由你决定是否还想和这位联系人聊。你可以什么也不做，或记下现在形成的简短念头。如果有独立的新话想说，先用 QQ 工具核对原联系人，再按实际回执记录结果。别把新话说成当时的原话，也别补写或重发任何旧段。`;
+  return `QQ 已恢复，你在 ${recovery.fact.at} 给联系人 ${recovery.userId} 发的私聊中断了。对方没有发来这条提示。\n${recovery.fact.description}\n先调用 autonomy_qq_interruption 查看尚可领取的未发草稿，再决定想不想接着聊。草稿仅供本轮参考，按自己的想法判断。想继续时先用 QQ 工具核对原联系人，用现在想说的话接下去，无需照抄，也别重发已发送的段。想暂缓或不说也可以。草稿不可用时沿用已知进度，别猜原话。以实际发送回执记录结果。`;
 }
 interface Active {
   id: string; session: string; controller: AbortController; task: Promise<void>;
   completed: boolean; finishing: boolean; started: boolean; run: RunRecord;
-  readQqText?: boolean; qqOutcome?: string; recovery?: Recovery;
+  readQqText?: boolean; qqOutcome?: string; recovery?: Recovery; checkedDraft?: boolean;
 }
 export interface RuntimeOptions { now?: () => number; random?: () => number; timers?: boolean; }
 
@@ -86,6 +86,8 @@ export class Autonomy {
   private refreshingQq = false;
   private lastReconnectRead?: { session: string; account: string; onlineAt: number };
   private qqReadTurns = new Map<string, unknown>();
+  // Only the receipt identity is needed to keep a voluntary follow-up thought.
+  private draftTurn?: { session: string; incoming?: string; peer?: string; account?: string; run?: string; delivery: string; at: string };
   private timer: ReturnType<typeof setTimeout> | null = null;
   private configQueue: Promise<unknown> = Promise.resolve();
   private recovered = new Set<string>();
@@ -118,6 +120,8 @@ export class Autonomy {
     this.ctx.effect(() => () => { this.ctx.signal.removeEventListener('abort', stop); this.stop(); });
     this.ctx.on('channel/message', event => this.observeMessage(event));
     this.ctx.on('channel/reply', event => {
+      if (this.draftTurn?.session === event.session && this.draftTurn?.incoming === event.external_message_id &&
+          event.channel === 'qq' && event.role === 'assistant') this.draftTurn = undefined;
       if (event.session && event.role === 'assistant' && event.origin?.action === '生成回复' &&
           this.qqReadTurns.get(event.session) === event.external_message_id) this.qqReadTurns.delete(event.session);
       return this.observeMessage(event);
@@ -278,17 +282,49 @@ export class Autonomy {
       return false;
     }
   }
-  async recentInterruption(session: ToolSession) {
+  async recentInterruption(session: ToolSession, withDraft = false) {
     this.guard();
-    if (!session.id || session.permission === 'off' || session.origin?.plugin !== 'qq' ||
-        session.channel !== 'qq' || !session.account || !/^direct:[1-9]\d{4,19}$/.test(session.peer ?? '') ||
+    if (!session.id || session.permission === 'off' ||
         await this.selected() !== session.id) return { status: 'unavailable', items: [] };
     session.signal?.throwIfAborted();
-    const fact = await this.interruptions.recent(session, (await this.state(session.id)).runs);
+    const job = this.active;
+    let entry: Recovery | null;
+    if (session.origin?.plugin === 'autonomy' && session.origin.action === '自主唤起' &&
+        session.channel === 'plugin' && session.account === 'autonomy' && session.peer === session.id &&
+        job?.session === session.id && job.started && !job.controller.signal.aborted && job.recovery) {
+      entry = job.recovery;
+    } else if (session.origin?.plugin === 'qq' && session.channel === 'qq' && session.account &&
+        /^direct:[1-9]\d{4,19}$/.test(session.peer ?? '')) {
+      const fact = await this.interruptions.recent(session, (await this.state(session.id)).runs);
+      entry = fact ? { accountId: session.account, userId: session.peer!.slice(7), deliveryId: fact.deliveryId, fact } : null;
+    } else return { status: 'unavailable', items: [] };
     session.signal?.throwIfAborted();
     if (await this.selected() !== session.id) return { status: 'unavailable', items: [] };
-    return { status: 'ok', items: fact ? [{ at: fact.at, summary: fact.description,
-      total: fact.total, sent: fact.sent, notSent: fact.notSent, unknown: fact.unknown, originalAvailable: fact.originalAvailable }] : [] };
+    if (!entry) return { status: 'ok', items: [] };
+    const { fact, accountId, deliveryId, userId } = entry;
+    const parts = withDraft && session.transientContext
+      ? await this.qq.readTemporaryDraft(session, { sessionId: session.id, accountId, deliveryId, userId }, fact) : null;
+    session.signal?.throwIfAborted();
+    if (await this.selected() !== session.id) return { status: 'unavailable', items: [] };
+    if (job?.recovery === entry && this.active === job && withDraft) job.checkedDraft = true;
+    if (parts && (job?.recovery === entry || typeof session.external_message_id === 'string')) this.draftTurn = {
+      session: session.id, incoming: typeof session.external_message_id === 'string' ? session.external_message_id : undefined, peer: session.peer,
+      account: session.account, run: job?.recovery === entry ? job.id : undefined, delivery: deliveryId, at: fact.at };
+    return { status: 'ok', items: [{ at: fact.at, summary: fact.description,
+      total: fact.total, sent: fact.sent, notSent: fact.notSent, unknown: fact.unknown, originalAvailable: !!parts,
+      ...(parts ? { parts } : {}) }] };
+  }
+  async rememberDraftFollowup(session: ToolSession) {
+    const turn = this.draftTurn;
+    if (!turn || !session.id || turn.session !== session.id || !session.transientContext || session.permission === 'off' ||
+        turn.peer !== session.peer || turn.account !== session.account || (!turn.run && turn.incoming !== session.external_message_id) ||
+        (turn.run ? this.active?.id !== turn.run || session.origin?.plugin !== 'autonomy'
+          : session.origin?.plugin !== 'qq' || session.peer !== 'direct:' + session.sender) ||
+        await this.selected() !== session.id) throw Error('只能在刚看过这份临时草稿的判断中保留念头。');
+    session.signal?.throwIfAborted();
+    return this.intents.change(session.id, { action: 'remember', kind: 'thought', source: 'self',
+      requestId: 'qq-followup:' + digest(turn.delivery), text: '我想稍后接着聊那次说到一半的 QQ 私聊。',
+      evidence: `我刚核对了 ${turn.at} 的中断，自己决定把这个话题留到以后。` });
   }
   private async recover(session: string) {
     if (!this.recovered.has(session)) await this.excludeLegacyInputs(session);
@@ -518,6 +554,7 @@ export class Autonomy {
     }
     job.started = true;
     this.qqReadTurns.delete(job.session);
+    this.draftTurn = undefined;
     this.active = job;
     return true;
   }
@@ -565,6 +602,7 @@ export class Autonomy {
         this.log(!active.started ? '排队结束，未执行' : busy ? '跳过' : '未正常结束', reason);
       }
     } finally {
+      if (this.draftTurn?.run === active.id) this.draftTurn = undefined;
       // Even persisting the failure state can fail. Once the job leaves memory,
       // revisit its durable state on recovery instead of leaving it running forever.
       if (!active.completed) this.recovered.delete(active.session);
@@ -588,6 +626,8 @@ export class Autonomy {
     const active = this.active;
     if (!active || args.runId !== active.id || session.id !== active.session || session.origin?.plugin !== 'autonomy' || session.origin.action !== '自主唤起') throw Error('结束工具只用于当前这一次自主判断');
     if (active.finishing || active.completed || active.controller.signal.aborted) throw Error('本轮已经结束或取消');
+    if (active.recovery && !active.checkedDraft && this.qq.supportsTemporaryDraft())
+      throw Error('请先调用 autonomy_qq_interruption 查看这次中断的回执和可用草稿，再决定是否接着说。');
     if (args.decision !== 'no_action' && args.decision !== 'acted') throw Error('结束决定无效');
     const reason = this.readQqTextInRound(session)
       ? active.qqOutcome ?? (args.decision === 'no_action' ? '看过未说完的话后，决定本轮暂不行动。' : '看过未说完的话后结束本轮，具体行动以工具回执为准。')

@@ -33,14 +33,15 @@ function fixture(changes: Record<string, unknown> = {}) {
       callback({ service, signal: controller.signal, effect: (fn: () => () => unknown) => { cleanups.push(fn()); } });
     },
   };
-  const qq = new QqContinuation(ctx as any, f.runtime.intents, async () => current, () => f.now);
+  const reads: ToolSession[] = [];
+  const qq = new QqContinuation(ctx as any, f.runtime.intents, async () => current, () => f.now, session => { reads.push(session); });
   qq.start();
   const session: ToolSession = { id: 'one', permission: 'full' };
   async function linked() {
     await qq.check('one');
     return (await f.runtime.intents.list('one'))[0].id;
   }
-  return { ...f, item, tools, hooks, service, qq, session, linked, get sends(){ return sends; },
+  return { ...f, item, tools, hooks, service, qq, session, linked, reads, get sends(){ return sends; },
     async change() { hooks.get('plugin:qq:text-delivery-changed')?.(); await qq.check('one'); },
     async act(intentId: string, action = 'resume', options: Record<string, unknown> = {}, trusted = session) {
       return tools.get('autonomy_qq_decide').run({ action, intentId, revision: item.revision, ...options }, trusted);
@@ -122,6 +123,83 @@ test('不支持续发的兼容提供者可读，缺少契约的提供者只关�
   await missing.qq.check('one');
   assert.equal(missing.tools.size, 0);
   assert.equal((await missing.runtime.intents.list('one')).length, 0);
+});
+
+const draftKey = { sessionId: 'one', accountId: '100001', deliveryId: 'delivery_' + 'a'.repeat(64) };
+const target = { ...draftKey, userId: '200002' };
+const progress = { total: 8, sent: 2, notSent: 6, unknown: 0 };
+const asker: ToolSession = { id: 'one', channel: 'qq', account: target.accountId, peer: 'direct:' + target.userId,
+  sender: target.userId, permission: 'full', origin: { plugin: 'qq' }, transientContext: true };
+const reviewing: ToolSession = { id: 'one', channel: 'plugin', account: 'autonomy', peer: 'one', permission: 'full',
+  origin: { plugin: 'autonomy', action: '自主唤起' }, transientContext: true };
+const parts = Array.from({ length: 6 }, (_, i) => ({ index: i + 3, text: 'synthetic remaining part ' + (i + 3) }));
+
+function draftFixture(change?: Record<string, unknown>) {
+  const claims: unknown[] = [], releases: unknown[] = [];
+  const result = { status: 'claimed', ...target, expiresAt: '2035-02-01T00:00:00Z', parts, ...change };
+  const f = fixture({ temporaryDraftApiVersion: '1.0.0', getSelfId: () => target.accountId,
+    claimTemporaryDraft: async (key: unknown) => { claims.push(key); return claims.length === 1 ? result : { status: 'unavailable' }; },
+    releaseTemporaryDraft: async (key: unknown) => { releases.push(key); return { status: 'released' }; },
+  });
+  return { ...f, claims, releases };
+}
+
+test('an ordinary QQ follow-up or an autonomous review can read only this delivery’s unsent tail', async t => {
+  for (const session of [asker, reviewing]) {
+    const f = draftFixture(); t.after(f.close);
+    assert.equal(f.qq.supportsTemporaryDraft(), true);
+    assert.deepEqual(await f.qq.readTemporaryDraft(session, target, progress), parts);
+    assert.deepEqual(f.claims, [draftKey]); assert.deepEqual(f.releases, [draftKey]);
+    assert.deepEqual(f.reads, [session]);
+    assert.equal(await f.qq.readTemporaryDraft(session, target, progress), null);
+    assert.deepEqual(f.reads, [session]); assert.equal(f.sends, 0);
+    assert.ok(!JSON.stringify([...f.documents.values()]).includes(parts[0].text));
+  }
+});
+
+test('an unrelated turn or an uncertain receipt cannot consume or release a draft', async t => {
+  const f = draftFixture(); t.after(f.close);
+  for (const session of [{ ...asker, permission: 'off' as const }, { ...asker, channel: 'web' }, { ...asker, account: '100003' },
+    { ...asker, sender: '200003' }, { ...asker, peer: 'direct:200003' }, { ...asker, id: 'two' },
+    { ...asker, transientContext: false }, { ...reviewing, origin: { plugin: 'qq' } }, { ...reviewing, peer: 'two' }]) {
+    assert.equal(await f.qq.readTemporaryDraft(session, target, progress), null);
+  }
+  f.selectCurrent('two');
+  assert.equal(await f.qq.readTemporaryDraft(asker, target, progress), null);
+  f.selectCurrent('one');
+  for (const counts of [{ ...progress, unknown: 1 }, { ...progress, notSent: null }, { ...progress, sent: 1 }])
+    assert.equal(await f.qq.readTemporaryDraft(asker, target, counts), null);
+  assert.deepEqual(f.claims, []); assert.deepEqual(f.releases, []);
+  const legacy = fixture(); t.after(legacy.close);
+  assert.equal(legacy.qq.supportsTemporaryDraft(), false);
+  assert.equal(await legacy.qq.readTemporaryDraft(asker, target, progress), null);
+});
+
+test('a mismatched or expired draft is discarded without disclosing provider data', async t => {
+  for (const change of [{ sessionId: 'two' }, { accountId: '100004' }, { userId: '200003' }, { deliveryId: 'another' },
+    { expiresAt: '2002-01-01T00:00:00Z' }, { parts: parts.slice(1) },
+    { parts: parts.map((p,i) => i === 0 ? { index: 2, text: 'already delivered' } : p) }]) {
+    const f = draftFixture(change); t.after(f.close);
+    assert.equal(await f.qq.readTemporaryDraft(asker, target, progress), null);
+    assert.deepEqual(f.releases, [draftKey]); assert.equal(f.reads.length, 0);
+  }
+});
+
+test('loss of a draft reply and cancellation during the claim both leave only progress', async t => {
+  for (const outcome of ['lost', 'cancelled', 'switched']) {
+    const controller = new AbortController(), releases: unknown[] = [];
+    const f = fixture({ temporaryDraftApiVersion: '1.0.0', getSelfId: () => target.accountId,
+      claimTemporaryDraft: async () => {
+        if (outcome === 'lost') throw Error('private synthetic raw body');
+        if (outcome === 'cancelled') controller.abort(); else f.selectCurrent('two');
+        return { status: 'claimed', ...target, expiresAt: '2035-02-01T00:00:00Z', parts };
+      },
+      releaseTemporaryDraft: async (key: unknown) => { releases.push(key); return { status: 'released' }; },
+    });
+    t.after(f.close);
+    assert.equal(await f.qq.readTemporaryDraft({ ...asker, signal: controller.signal }, target, progress), null);
+    assert.deepEqual(releases, [draftKey]); assert.equal(f.reads.length, 0);
+  }
 });
 
 test('分页边界失效从第一页补读，重复行只建一条，尚在发送的原话不建念头', async t => {
