@@ -17,6 +17,16 @@ export async function apply(ctx: Context) {
     return session.id;
   };
   ctx.tools.register({
+    name: 'autonomy_qq_interruption', danger: 'safe', origin: { platform: '自主性', action: '核对最近未说完的私聊' },
+    description: '在 QQ 私聊里，对方问“怎么了？”“刚才想说什么？”或接着上一段追问时，回答前先查这个工具。若最近跟这位联系人确实有话没说完，可按记录解释发生了什么，是否接着聊由你决定。结合时间判断这件事是否仍相关。临时私聊所有分段都没有原文，不能把前后聊天当成其中某段，也不能推测对方看到什么。不重发旧消息。没有相关记录就照常交流。无需填写联系人或会话。',
+    schema: { type: 'object', properties: {}, additionalProperties: false },
+    run: async (args: Record<string, unknown>, session) => {
+      if (!args || typeof args !== 'object' || Object.keys(args).length) return { status: 'invalid_input', items: [] };
+      try { return await runtime.recentInterruption(session); }
+      catch { return { status: 'unavailable', items: [] }; }
+    },
+  });
+  ctx.tools.register({
     name: 'autonomy_schedule', danger: 'safe', origin: { platform: '自主性', action: '安排自行唤醒' },
     description: '查看、设置或取消当前会话的下一次自行唤醒，普通交流和自主轮次都可使用。先 get 获取 version、现有安排、用户开关和睡眠规则；set/cancel 必填 requestId 和 version。set 使用未来带时区 ISO 时间 at 和自己的简短 reason，同一会话只保留一个安排，重新设置会替换原安排。用户须开启自动唤醒及自行安排开关；默认不能设在睡眠时段，只有用户开启睡眠例外才可突破，失败时向用户说明真实原因。到点唤醒不掷骰子，排队等待当前交流结束；这是再次判断的机会，行动仍由你决定，可以不行动，也不必每轮都安排。不是向用户承诺已经执行，不把普通念头伪装为对外约定。一次性安排在开始判断时消耗，之后不会因失败而重放。改期/取消须使用最新 version；同一操作重试保留 requestId。reason 仅写自己的目的，不复制临时外部正文或过期引用。不能用此工具安排盲目重发结果不确定的旧动作。',
     schema: { type: 'object', additionalProperties: false, required: ['action'], properties: {

@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { defaults, settings, sleeping, probability, type Settings } from './config.ts';
 import { Documents, Intents, digest, text, iso, type Intent } from './storage.ts';
 import { QqContinuation } from './qq-continuation.ts';
+import { QqInterruptions } from './qq-interruption.ts';
 
 export type Decision = 'no_action' | 'acted';
 export type Phase = 'queued' | 'cancelled' | 'running' | 'settling' | 'completed' | 'failed' | 'interrupted' | 'uncertain' | 'busy';
@@ -63,6 +64,7 @@ export class Autonomy {
   readonly docs: Documents;
   readonly intents: Intents;
   readonly qq: QqContinuation;
+  private readonly interruptions: QqInterruptions;
   readonly now: () => number;
   readonly random: () => number;
   config: Settings = structuredClone(defaults);
@@ -87,6 +89,7 @@ export class Autonomy {
     this.ctx = ctx; this.now = options.now ?? Date.now; this.random = options.random ?? Math.random;
     this.timers = options.timers !== false;
     this.docs = new Documents(ctx.memory); this.intents = new Intents(this.docs, this.now);
+    this.interruptions = new QqInterruptions(this.docs);
     this.qq = new QqContinuation(ctx, this.intents, () => this.selected(), this.now, (session, outcome) => {
       if (outcome === undefined && session.id) this.qqReadTurns.set(session.id, session.external_message_id);
       const job = this.active;
@@ -115,6 +118,9 @@ export class Autonomy {
     });
     this.ctx.on('tool/called', async event => {
       if (this.stopped || !event.session || event.source === 'autonomy' || !event.ok) return;
+      if (event.source === 'qq' && event.name === 'qq_send_message' && event.transient) {
+        await this.syncInterruptions(event.session);
+      }
       await this.noteActivity(event.session).catch(error => this.log('记录失败', message(error)));
     });
     this.ctx.on('whalelife/ready', () => { if (this.timers) this.schedule(); });
@@ -255,6 +261,26 @@ export class Autonomy {
     if (this.stopped || !event.session || event.origin?.plugin === 'autonomy') return;
     await this.noteActivity(event.session).catch(error => this.log('记录失败', message(error)));
   }
+  private async syncInterruptions(session: string) {
+    try {
+      this.guard();
+      await this.interruptions.sync(session, (await this.state(session)).runs);
+    } catch {
+      if (!this.stopped) this.log('QQ 中断记录', '暂时无法核对私聊回执，下次查询时会重新读取。');
+    }
+  }
+  async recentInterruption(session: ToolSession) {
+    this.guard();
+    if (!session.id || session.permission === 'off' || session.origin?.plugin !== 'qq' ||
+        session.channel !== 'qq' || !session.account || !/^direct:[1-9]\d{4,19}$/.test(session.peer ?? '') ||
+        await this.selected() !== session.id) return { status: 'unavailable', items: [] };
+    session.signal?.throwIfAborted();
+    const fact = await this.interruptions.recent(session, (await this.state(session.id)).runs);
+    session.signal?.throwIfAborted();
+    if (await this.selected() !== session.id) return { status: 'unavailable', items: [] };
+    return { status: 'ok', items: fact ? [{ at: fact.at, summary: fact.description,
+      total: fact.total, sent: fact.sent, notSent: fact.notSent, unknown: fact.unknown, originalAvailable: fact.originalAvailable }] : [] };
+  }
   private async recover(session: string) {
     if (!this.recovered.has(session)) await this.excludeLegacyInputs(session);
     // Conversation tools can stage a new result after initial recovery. Retry only
@@ -280,6 +306,7 @@ export class Autonomy {
       }
     }
     this.recovered.add(session);
+    void this.syncInterruptions(session);
   }
   private async excludeLegacyInputs(session: string) {
     // Match both our durable round ledger and the exact old input envelope.
