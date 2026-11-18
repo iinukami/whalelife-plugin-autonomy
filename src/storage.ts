@@ -54,16 +54,20 @@ function validateArguments(args: Record<string, unknown>) {
   }
   return action;
 }
+export interface QQDeliveryRef { accountId: string; deliveryId: string }
 export interface Intent {
   id: string; version: number; kind: 'thought' | 'agreement'; text: string;
   createdAt: string; updatedAt: string; source: 'self' | 'conversation'; evidence: string;
   preferredAt: string | null; dueAt: string | null;
   state: 'open' | 'settling';
+  qq?: QQDeliveryRef & { reviewedRevision?: string; attemptedRevision?: string; abandonReason?: string };
 }
 interface Pending { intentId: string; experience: ExperienceInput; }
 interface IntentDocument {
   schema: 1; items: Intent[]; pending: Pending[];
   receipts: { key: string; hash: string; result: unknown }[];
+  // An acknowledged send can outlive a failure in QQ's own receipt storage.
+  qqConfirmed?: QQDeliveryRef[];
 }
 export class Documents {
   memory: MemoryAPI;
@@ -93,12 +97,39 @@ export class Documents {
   }
 }
 export const emptyIntents = (): IntentDocument => ({ schema: 1, items: [], pending: [], receipts: [] });
+function qqIdentifier(value: string) {
+  // QQ identifiers and revisions are opaque. Do not trim or normalize them.
+  if (typeof value !== 'string' || !value.length || value.length > 200 || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw Error('QQ 投递标识无效');
+  }
+  return value;
+}
+function qqIntentId(session: string, ref: QQDeliveryRef) {
+  return 'qq-' + digest([session, qqIdentifier(ref.accountId), qqIdentifier(ref.deliveryId)]);
+}
+function reserveOutcomeSpace(data: IntentDocument) {
+  if (Buffer.byteLength(JSON.stringify(data), 'utf8') > 200000) {
+    throw Error('意图文档接近容量上限，已预留完成和放弃的记录空间；请先处理已有事项');
+  }
+}
 function validate(d: IntentDocument) {
   if (d.schema !== 1 || !Array.isArray(d.items) || !Array.isArray(d.pending) || !Array.isArray(d.receipts)) throw Error('意图文档版本或结构不受支持；原数据保留');
+  if (d.qqConfirmed !== undefined) {
+    if (!Array.isArray(d.qqConfirmed)) throw Error('QQ 续发确认记录无效');
+    for (const ref of d.qqConfirmed) { qqIdentifier(ref.accountId); qqIdentifier(ref.deliveryId); }
+  }
   for (const i of d.items) {
     if (!i.id || !Number.isSafeInteger(i.version) || !['thought','agreement'].includes(i.kind) || !['open','settling'].includes(i.state)) throw Error('意图文档损坏；原数据保留');
     text(i.text, '意图'); iso(i.createdAt); iso(i.updatedAt); iso(i.preferredAt); iso(i.dueAt);
     if (i.kind === 'thought' && i.dueAt) throw Error('普通念头不能带强制唤起时间');
+    if (i.qq !== undefined) {
+      if (!i.qq || i.kind !== 'thought') throw Error('QQ 未完成表达的念头结构无效');
+      qqIdentifier(i.qq.accountId);
+      qqIdentifier(i.qq.deliveryId);
+      if (i.qq.reviewedRevision !== undefined) qqIdentifier(i.qq.reviewedRevision);
+      if (i.qq.attemptedRevision !== undefined) qqIdentifier(i.qq.attemptedRevision);
+      if (i.qq.abandonReason !== undefined) text(i.qq.abandonReason, '放弃原因', 140);
+    }
   }
   return d;
 }
@@ -108,6 +139,98 @@ export class Intents {
   async list(session: string) {
     const { data } = await this.docs.read(session, 'intents', emptyIntents);
     return structuredClone(validate(data).items);
+  }
+  async linkQQ(session: string, ref: QQDeliveryRef, createdAt?: string): Promise<Intent> {
+    const id = qqIntentId(session, ref);
+    return this.docs.serial(session, 'intents', async () => {
+      const { data, revision } = await this.docs.read(session, 'intents', emptyIntents);
+      const existing = validate(data).items.find(item => item.id === id);
+      if (existing) return existing;
+      if (data.qqConfirmed?.some(r => r.accountId === ref.accountId && r.deliveryId === ref.deliveryId)) {
+        throw Error('QQ 已确认原文字全部发送，无需再建立未完成念头');
+      }
+      const now = new Date(this.now()).toISOString();
+      const item: Intent = {
+        id, version: 1, kind: 'thought', state: 'open', source: 'conversation',
+        text: '我在 QQ 有话没说完，想等能联系时看看是否还要接着说。',
+        evidence: 'QQ 的原文字投递记录仍未完成。',
+        createdAt: iso(createdAt) ?? now, updatedAt: now, dueAt: null, preferredAt: null,
+        qq: { accountId: ref.accountId, deliveryId: ref.deliveryId },
+      };
+      data.items.push(item);
+      reserveOutcomeSpace(data);
+      await this.docs.write(session, 'intents', revision, data);
+      return item;
+    });
+  }
+  private async updateQQ(session: string, ref: QQDeliveryRef, change: (item: Intent, data: IntentDocument) => boolean, required = false) {
+    const id = qqIntentId(session, ref);
+    await this.docs.serial(session, 'intents', async () => {
+      const { data, revision } = await this.docs.read(session, 'intents', emptyIntents);
+      const item = validate(data).items.find(i => i.id === id);
+      if (!item?.qq || item.state !== 'open') {
+        if (required) throw Error('未找到可处理的 QQ 未完成表达');
+        return;
+      }
+      if (!change(item, data)) return;
+      item.version++;
+      item.updatedAt = new Date(this.now()).toISOString();
+      await this.docs.write(session, 'intents', revision, data);
+    });
+  }
+  async reviewQQ(session: string, ref: QQDeliveryRef, revision: string, attempted = false) {
+    qqIdentifier(revision);
+    await this.updateQQ(session, ref, item => {
+      if (item.qq!.reviewedRevision === revision && (!attempted || item.qq!.attemptedRevision === revision)) return false;
+      item.qq!.reviewedRevision = revision;
+      if (attempted) item.qq!.attemptedRevision = revision;
+      return true;
+    });
+  }
+  async prepareQQAbandon(session: string, ref: QQDeliveryRef, reason: string) {
+    const explanation = text(reason, '放弃原因', 140);
+    await this.updateQQ(session, ref, item => {
+      if (item.qq!.abandonReason === explanation) return false;
+      item.qq!.abandonReason = explanation;
+      return true;
+    }, true);
+  }
+  async verifiedQQClosures(session: string): Promise<QQDeliveryRef[]> {
+    const { data } = await this.docs.read(session, 'intents', emptyIntents);
+    return validate(data).qqConfirmed ?? [];
+  }
+  async forgetQQClosures(session: string, refs: QQDeliveryRef[]) {
+    if (!refs.length) return;
+    const ids = new Set(refs.map(ref => qqIntentId(session, ref)));
+    await this.docs.serial(session, 'intents', async () => {
+      const { data, revision } = await this.docs.read(session, 'intents', emptyIntents);
+      const before = validate(data).qqConfirmed ?? [];
+      const remaining = before.filter(ref => !ids.has(qqIntentId(session, ref)));
+      if (remaining.length === before.length) return;
+      if (remaining.length) data.qqConfirmed = remaining;
+      else delete data.qqConfirmed;
+      await this.docs.write(session, 'intents', revision, data);
+    });
+  }
+  async closeQQ(session: string, ref: QQDeliveryRef, outcome: 'sent' | 'dismissed', receiptUnavailable = false) {
+    await this.updateQQ(session, ref, (item, data) => {
+      const sent = outcome === 'sent';
+      if (!sent && !item.qq!.abandonReason) throw Error('缺少此前明确放弃 QQ 续发的原因，保留念头供核对');
+      const label = sent ? '完成意图' : '明确放弃意图';
+      item.state = 'settling';
+      if (sent && receiptUnavailable) {
+        (data.qqConfirmed ??= []).push({ accountId: ref.accountId, deliveryId: ref.deliveryId });
+      }
+      data.pending.push({ intentId: item.id, experience: {
+        event_id: `intent:${item.id}:${outcome}`, outcome: 'succeeded',
+        text: sent ? '我在 QQ 没说完的那段话，现已得到平台的全部发送确认。'
+          : `我决定不再接着发送先前没说完的 QQ 原话。原因：${item.qq!.abandonReason}`,
+        occurred_at: new Date(this.now()).toISOString(), origin: { platform: '自主性', action: label },
+      } });
+      return true;
+    });
+    // QQ has already settled this plan. Retrying this outbox never performs a send.
+    await this.settle(session);
   }
   async settle(session: string) {
     return this.docs.serial(session, 'intents', async () => {
@@ -176,9 +299,7 @@ export class Intents {
       } else throw Error('意图操作无效');
       data.receipts.push({ key, hash, result });
       if (data.receipts.length > 200) data.receipts.splice(0, data.receipts.length - 200);
-      if ((action === 'remember' || action === 'revise') && Buffer.byteLength(JSON.stringify(data), 'utf8') > 200000) {
-        throw Error('意图文档接近容量上限，已预留完成和放弃的记录空间；请先处理已有事项');
-      }
+      if (action === 'remember' || action === 'revise') reserveOutcomeSpace(data);
       await this.docs.write(session, 'intents', snapshot.revision, data);
       return result;
     });
@@ -189,6 +310,7 @@ export class Intents {
   private find(data: IntentDocument, args: Record<string, unknown>) {
     const item = data.items.find(i => i.id === args.intentId);
     if (!item || item.state !== 'open') throw Error('意图不存在或正在记录结束结果，请重新读取');
+    if (item.qq) throw Error('请使用 QQ 未完成表达工具核对原投递，在那里选择继续、暂缓或说明原因后放弃');
     if (args.version !== item.version) throw Error('意图已经变更，请重新读取后再决定');
     return item;
   }

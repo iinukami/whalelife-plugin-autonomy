@@ -27,7 +27,10 @@ export async function apply(ctx: Context) {
       reason: { type: 'string', maxLength: 140, description: 'set 必填，自己为什么想在这个时间再醒来判断，不能复制外部资料' },
     } },
     run: async (args: Record<string, unknown>, session) => {
-      try { return { ok: true, ...await runtime.scheduleSelfWake(currentToolSession(session), args) }; }
+      try {
+        if (runtime.readQqTextInRound(session) && args.action !== 'get') return { ok: false, error: '本轮已查看临时原话。可以查看唤醒安排，写入新安排或取消请求请留到下一轮。' };
+        return { ok: true, ...await runtime.scheduleSelfWake(currentToolSession(session), args) };
+      }
       catch (error) { return { ok: false, error: errorText(error) }; }
     },
   });
@@ -46,7 +49,10 @@ export async function apply(ctx: Context) {
       reason: { type: 'string', maxLength: 140, description: 'complete/abandon 必填，实际结果与原因（1–140字）；还须单独填写 evidence' },
     } },
     run: async (args: Record<string, unknown>, session) => {
-      try { return { ok: true, ...await runtime.intents.change(currentToolSession(session), args) as object }; }
+      try {
+        if (runtime.readQqTextInRound(session) && args.action !== 'list') return { ok: false, error: '本轮已查看临时原话，请用 autonomy_qq_decide 处理对应念头，避免把原文抄入长期记忆。' };
+        return { ok: true, ...await runtime.intents.change(currentToolSession(session), args) as object };
+      }
       catch (error) { return { ok: false, error: errorText(error), ...(error instanceof IntentInputError ? {
         code: error.code, fields: error.fields, requiredFields: error.requiredFields,
         ...(error.code === 'missing_fields' ? { missingFields: error.fields } : {}),
