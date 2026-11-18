@@ -70,6 +70,48 @@ test('续发只允许当前可信会话、原 QQ 好友、完全权限和模型�
   assert.equal(f.sends, 0);
 });
 
+test('临时私聊只认真实重连；缓存可用于排队，执行前重新核对账号与已绑定会话', async t => {
+  const account = '100001';
+  let reads = 0, state = 'online', bound = 'one';
+  const f = fixture({ getSelfId: () => account, status: () => {
+    reads++;
+    return { state, binding: { state: 'ready', sessionId: bound } };
+  } }); t.after(f.close);
+  assert.equal(await f.qq.recoveryAccount('one', true), account);
+  assert.equal(f.qq.recoveryWindows(account).length, 0);
+  await f.qq.recoveryAccount('one');
+  assert.equal(reads, 1);
+  state = 'disconnected';
+  assert.equal(await f.qq.recoveryAccount('one', true), null);
+  state = 'online';
+  assert.equal(await f.qq.recoveryAccount('one', true), account);
+  assert.equal(f.qq.recoveryWindows(account).length, 1);
+  assert.equal(await f.qq.recoveryAccount('one', true), account);
+  assert.equal(f.qq.recoveryWindows(account).length, 1);
+  bound = 'two';
+  assert.equal(await f.qq.recoveryAccount('one', true), null);
+  f.selectCurrent('two');
+  assert.equal(await f.qq.recoveryAccount('one', true), null);
+  assert.equal(await f.qq.recoveryAccount('two', true), account);
+  assert.equal(f.qq.recoveryWindows('100002').length, 0);
+});
+
+test('断线通知废弃在途缓存；迟到的在线结果不能覆盖断线', async t => {
+  let release!: (status: unknown) => void;
+  const f = fixture({ getSelfId: () => '100001', status: () => new Promise(resolve => { release = resolve; }) }); t.after(f.close);
+  assert.equal(await f.qq.recoveryAccount('one'), null);
+  // The ordinary tick can proceed while the provider is slow.
+  assert.equal(await f.qq.recoveryAccount('one'), null);
+  const changed = f.hooks.get('plugin:qq:connection-changed') as ((value: unknown) => void);
+  changed({ accountId: '100001', state: 'disconnected' });
+  release({ state: 'online', binding: { state: 'ready', sessionId: 'one' } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.qq.recoveryWindows('100001').length, 0);
+  changed({ accountId: '100001', state: 'online' });
+  changed({ accountId: '100001', state: 'online' });
+  assert.equal(f.qq.recoveryWindows('100001').length, 1);
+});
+
 test('不支持续发的兼容提供者可读，缺少契约的提供者只关闭这项能力', async t => {
   const old = fixture({ textDeliveryResumeSupported: false }); t.after(old.close);
   const id = await old.linked();

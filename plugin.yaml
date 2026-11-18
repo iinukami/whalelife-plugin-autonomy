@@ -1,6 +1,6 @@
 id: autonomy
 name: 自主性
-version: 0.6.1
+version: 0.6.2
 description: 在用户配置的时段与概率下唤起当前会话，并管理会话意图与明确约定。
 apiVersion: "1.0.0"
 optionalDepends: [qq]

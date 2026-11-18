@@ -18,7 +18,7 @@ export async function apply(ctx: Context) {
   };
   ctx.tools.register({
     name: 'autonomy_qq_interruption', danger: 'safe', origin: { platform: '自主性', action: '核对最近未说完的私聊' },
-    description: '在 QQ 私聊里，对方问“怎么了？”“刚才想说什么？”或接着上一段追问时，回答前先查这个工具。若最近跟这位联系人确实有话没说完，可按记录解释发生了什么，是否接着聊由你决定。结合时间判断这件事是否仍相关。临时私聊所有分段都没有原文，不能把前后聊天当成其中某段，也不能推测对方看到什么。不重发旧消息。没有相关记录就照常交流。无需填写联系人或会话。',
+    description: '在 QQ 私聊里，对方问“怎么了？”“刚才想说什么？”或接着上一段追问时，回答前先查这个工具。结合时间判断是否与这次追问相关。如果当时发到一半，直接用自己的话告诉对方已发了几段、后来哪里中断，是否接着聊由你决定。仅在回执有确数时说明数量。临时私聊的分段没有原文，不能把前后聊天当成其中某段，也不能推测对方看到了什么。不重发旧消息。没有相关记录就照常交流。无需填写联系人或会话。',
     schema: { type: 'object', properties: {}, additionalProperties: false },
     run: async (args: Record<string, unknown>, session) => {
       if (!args || typeof args !== 'object' || Object.keys(args).length) return { status: 'invalid_input', items: [] };

@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import type { MemoryEvent } from 'whalelife';
 import { fake } from './fake.ts';
 
 test('QQ can discover an unfinished reply while paused or asleep; it waits for an allowed time to ask', async t => {
@@ -44,4 +45,38 @@ test('a queued QQ judgment rechecks eligibility after the human finishes speakin
   assert.equal((await f.runtime.status()).runs[0].phase, 'cancelled');
   assert.equal(f.requests.length, 0);
   assert.equal(f.experiences.size, 0);
+});
+
+test('a private follow-up can claim the same interruption while the reconnect judgment is queued', async t => {
+  const f = fake(), account = '100001', peer = 'direct:200002', session = 'one';
+  await f.initialize({ probability: 0 });
+  const at = (offset: number) => new Date(f.now + offset).toISOString();
+  const rows: MemoryEvent[] = [{ id: 'older', ts: at(0), session, type: 'tool' }];
+  f.ctx.memory.readSession = async () => rows.slice();
+  const holder = f.hold(session);
+  t.after(async () => { holder.release(); f.runtime.stop(); await f.runtime.idle(); });
+  await f.runtime.tick();
+  await f.flush();
+  const base: MemoryEvent = { id: 'gen', ts: at(20), session, type: 'channel_receipt', direction: 'out',
+    account, channel: 'qq', peer, conversation: { channel: 'qq', origin: { plugin: 'qq' }, account, peer },
+    status: 'generated', text: '[QQ 临时私聊；正文不留存；指纹 ' + 'a'.repeat(64) + ']',
+    external_message_id: 'test-action', delivery_id: 'delivery_' + 'c'.repeat(64) };
+  rows.push(base, { ...base, id: 'failure', ts: at(80), status: 'delivery_failed',
+    error: 'QQ 投递部分完成：共 8 段，确认发送 2 段，明确未发送 6 段（其中 5 段未提交），结果未知 0 段。' });
+  const start = f.now;
+  f.now += 100;
+  f.runtime.qq.recoveryAccount = async () => account;
+  f.runtime.qq.recoveryWindows = () => [{ offlineAt: start + 50, onlineAt: start + 95 }];
+  // The tool notification was missed. Reconnection rereads the public archive.
+  for (let i = 0; i < 5 && !f.submissions.length; i++) { await f.runtime.tick(); await f.flush(); }
+  assert.equal((await f.runtime.status()).queued[0]?.trigger, 'qq_interruption');
+  const query = () => f.runtime.recentInterruption({ id: session, permission: 'full', channel: 'qq', account, peer,
+    sender: '200002', origin: { plugin: 'qq' } });
+  assert.equal((await query()).items[0]?.sent, 2);
+  holder.release();
+  await holder.done;
+  await f.runtime.idle();
+  assert.equal(f.requests.length, 0);
+  assert.equal((await f.runtime.status()).runs[0].phase, 'cancelled');
+  assert.equal((await query()).items[0]?.notSent, 6);
 });

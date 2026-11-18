@@ -7,13 +7,13 @@ import { randomUUID } from 'node:crypto';
 import { defaults, settings, sleeping, probability, type Settings } from './config.ts';
 import { Documents, Intents, digest, text, iso, type Intent } from './storage.ts';
 import { QqContinuation } from './qq-continuation.ts';
-import { QqInterruptions } from './qq-interruption.ts';
+import { QqInterruptions, type QqInterruption } from './qq-interruption.ts';
 
 export type Decision = 'no_action' | 'acted';
 export type Phase = 'queued' | 'cancelled' | 'running' | 'settling' | 'completed' | 'failed' | 'interrupted' | 'uncertain' | 'busy';
 export interface SelfWake { id: string; at: string; reason: string; createdAt: string; }
 export interface RunRecord {
-  id: string; trigger: 'random' | 'agreement' | 'manual' | 'self' | 'qq_resume'; phase: Phase;
+  id: string; trigger: 'random' | 'agreement' | 'manual' | 'self' | 'qq_resume' | 'qq_interruption'; phase: Phase;
   queuedAt?: string; startedAt?: string; endedAt?: string; decision?: Decision; reason?: string;
   agreements: string[];
   inputMode?: 'transient' | 'excluded';
@@ -51,11 +51,16 @@ export function intentSnapshot(items: Intent[], now: number): string {
 }
 // Human messages use 0. Timed agreements share that FIFO lane; less urgent
 // autonomous opportunities wait behind human messages and timed agreements.
-const priorities = { agreement: 0, manual: -10, self: -15, qq_resume: -16, random: -20 };
+const priorities = { agreement: 0, manual: -10, self: -15, qq_resume: -16, qq_interruption: -16, random: -20 };
+type Recovery = { accountId: string; deliveryId: string; userId: string; fact: QqInterruption };
+function interruptionPrompt(recovery?: Recovery) {
+  if (!recovery) return '';
+  return `QQ 已恢复，核对一下你在 ${recovery.fact.at} 对联系人 ${recovery.userId} 说到一半的那次私聊。对方没有发来这条提示。\n${recovery.fact.description}\n现在由你决定是否还想和这位联系人聊。你可以什么也不做，或记下现在形成的简短念头。如果有独立的新话想说，先用 QQ 工具核对原联系人，再按实际回执记录结果。别把新话说成当时的原话，也别补写或重发任何旧段。`;
+}
 interface Active {
   id: string; session: string; controller: AbortController; task: Promise<void>;
   completed: boolean; finishing: boolean; started: boolean; run: RunRecord;
-  readQqText?: boolean; qqOutcome?: string;
+  readQqText?: boolean; qqOutcome?: string; recovery?: Recovery;
 }
 export interface RuntimeOptions { now?: () => number; random?: () => number; timers?: boolean; }
 
@@ -79,6 +84,7 @@ export class Autonomy {
   private stopped = false;
   private checking = false;
   private refreshingQq = false;
+  private lastReconnectRead?: { session: string; account: string; onlineAt: number };
   private qqReadTurns = new Map<string, unknown>();
   private timer: ReturnType<typeof setTimeout> | null = null;
   private configQueue: Promise<unknown> = Promise.resolve();
@@ -89,7 +95,7 @@ export class Autonomy {
     this.ctx = ctx; this.now = options.now ?? Date.now; this.random = options.random ?? Math.random;
     this.timers = options.timers !== false;
     this.docs = new Documents(ctx.memory); this.intents = new Intents(this.docs, this.now);
-    this.interruptions = new QqInterruptions(this.docs);
+    this.interruptions = new QqInterruptions(this.docs, this.now());
     this.qq = new QqContinuation(ctx, this.intents, () => this.selected(), this.now, (session, outcome) => {
       if (outcome === undefined && session.id) this.qqReadTurns.set(session.id, session.external_message_id);
       const job = this.active;
@@ -117,10 +123,11 @@ export class Autonomy {
       return this.observeMessage(event);
     });
     this.ctx.on('tool/called', async event => {
-      if (this.stopped || !event.session || event.source === 'autonomy' || !event.ok) return;
+      if (this.stopped || !event.session || event.source === 'autonomy') return;
       if (event.source === 'qq' && event.name === 'qq_send_message' && event.transient) {
         await this.syncInterruptions(event.session);
       }
+      if (!event.ok) return;
       await this.noteActivity(event.session).catch(error => this.log('记录失败', message(error)));
     });
     this.ctx.on('whalelife/ready', () => { if (this.timers) this.schedule(); });
@@ -265,8 +272,10 @@ export class Autonomy {
     try {
       this.guard();
       await this.interruptions.sync(session, (await this.state(session)).runs);
+      return true;
     } catch {
       if (!this.stopped) this.log('QQ 中断记录', '暂时无法核对私聊回执，下次查询时会重新读取。');
+      return false;
     }
   }
   async recentInterruption(session: ToolSession) {
@@ -357,7 +366,19 @@ export class Autonomy {
       // A slow optional provider must not hold up a timed agreement or other checks.
       if (!this.refreshingQq) {
         this.refreshingQq = true;
-        void this.qq.check(id).catch(() => this.log('QQ 续发进度', '本次未能核对，将在后续检查时再读取。'))
+        void this.qq.check(id).then(async () => {
+          const account = await this.qq.recoveryAccount(id);
+          if (!account || this.stopped || await this.selected() !== id) return;
+          const windows = this.qq.recoveryWindows(account);
+          const latest = windows.at(-1);
+          if (!latest) return;
+          const last = this.lastReconnectRead;
+          if (last?.session !== id || last.account !== account || last.onlineAt !== latest.onlineAt) {
+            if (!await this.syncInterruptions(id)) return;
+            this.lastReconnectRead = { session: id, account, onlineAt: latest.onlineAt };
+          }
+          await this.interruptions.observeRecovery(id, account, windows);
+        }).catch(() => this.log('QQ 续发进度', '本次未能核对，将在后续检查时再读取。'))
           .finally(() => { this.refreshingQq = false; });
       }
       if (!this.config.enabled) return;
@@ -384,10 +405,19 @@ export class Autonomy {
         await this.begin(id, 'self', [], state.selfWake);
         return;
       }
-      if (this.active?.run.trigger !== 'qq_resume' && !this.pending(id, 'qq_resume') &&
-          !sleeping(this.config, now) && await this.qq.ready(id)) {
-        await this.begin(id, 'qq_resume', []);
-        return;
+      if (!sleeping(this.config, now)) {
+        if (this.active?.run.trigger !== 'qq_resume' && !this.pending(id, 'qq_resume') && await this.qq.ready(id)) {
+          await this.begin(id, 'qq_resume', []);
+          return;
+        }
+        if (this.active?.run.trigger !== 'qq_interruption' && !this.pending(id, 'qq_interruption')) {
+          const accountId = await this.qq.recoveryAccount(id);
+          const item = accountId && await this.interruptions.peekRecovery(id, accountId);
+          if (accountId && item) {
+            await this.begin(id, 'qq_interruption', [], undefined, { accountId, ...item });
+            return;
+          }
+        }
       }
       if (now < this.nextCheck) return;
       // At most one ordinary opportunity waits, even while another is running.
@@ -412,15 +442,15 @@ export class Autonomy {
   }
   private scheduleInvalid(job: Active) {
     return job.run.trigger !== 'manual' && (!this.config.enabled ||
-      ((job.run.trigger === 'random' || job.run.trigger === 'qq_resume') && sleeping(this.config, this.now())) ||
+      ((job.run.trigger === 'random' || job.run.trigger === 'qq_resume' || job.run.trigger === 'qq_interruption') && sleeping(this.config, this.now())) ||
       (job.run.trigger === 'self' && (!this.config.allowSelfWake || (!this.config.selfWakeDuringSleep && sleeping(this.config, this.now())))));
   }
-  private begin(session: string, trigger: RunRecord['trigger'], due: Intent[], selfWake?: SelfWake) {
-    const task = this.submissionQueue.catch(() => {}).then(() => this.submit(session, trigger, due, selfWake));
+  private begin(session: string, trigger: RunRecord['trigger'], due: Intent[], selfWake?: SelfWake, recovery?: Recovery) {
+    const task = this.submissionQueue.catch(() => {}).then(() => this.submit(session, trigger, due, selfWake, recovery));
     this.submissionQueue = task;
     return task;
   }
-  private async submit(session: string, trigger: RunRecord['trigger'], due: Intent[], selfWake?: SelfWake) {
+  private async submit(session: string, trigger: RunRecord['trigger'], due: Intent[], selfWake?: SelfWake, recovery?: Recovery) {
     this.guard();
     if (this.active && this.active.session !== session) {
       this.active.controller.abort(Error('当前会话已切换'));
@@ -430,7 +460,7 @@ export class Autonomy {
     if (trigger !== 'agreement' && pending) return { jobId: pending.id, status: 'queued' as const, merged: true };
     const id = randomUUID(), controller = new AbortController();
     const run: RunRecord = { id, trigger, phase: 'queued', queuedAt: new Date(this.now()).toISOString(), agreements: due.map(agreementKey), inputMode: 'transient', ...(selfWake ? { selfWake: structuredClone(selfWake) } : {}) };
-    const active: Active = { id, session, controller, completed: false, finishing: false, started: false, run, task: Promise.resolve() };
+    const active: Active = { id, session, controller, completed: false, finishing: false, started: false, run, recovery, task: Promise.resolve() };
     this.jobs.set(id, active);
     try {
       if (await this.selected() !== session) throw Error('当前会话已切换');
@@ -459,6 +489,10 @@ export class Autonomy {
     if (job.run.trigger === 'qq_resume' && !await this.qq.claim(job.session)) {
       return cancel('QQ 续发条件已变化，这次无需唤醒');
     }
+    if (job.recovery) {
+      if (await this.qq.recoveryAccount(job.session, true) !== job.recovery.accountId)
+        return cancel('QQ 账号、连接或会话绑定已变化');
+    }
     job.controller.signal.throwIfAborted();
     await this.updateState(job.session, state => {
       const run = state.runs.find(r => r.id === job.id);
@@ -476,6 +510,12 @@ export class Autonomy {
     job.controller.signal.throwIfAborted();
     if (await this.selected() !== job.session || this.scheduleInvalid(job)) return cancel('开始前请求已失效');
     job.controller.signal.throwIfAborted();
+    if (job.recovery) {
+      const { accountId, deliveryId, fact } = job.recovery;
+      if (!await this.interruptions.claimRecovery(job.session, accountId, deliveryId, fact))
+        return cancel('这次临时私聊的回执已更新或已经核对过');
+      job.controller.signal.throwIfAborted();
+    }
     job.started = true;
     this.qqReadTurns.delete(job.session);
     this.active = job;
@@ -539,6 +579,7 @@ export class Autonomy {
       manual: '用户在自主插件页面请求一次自主判断。',
       random: '本地随机唤醒。',
       qq_resume: 'QQ 中原先没说完的话已有可续发的部分。先核对当前进度和后续交流，再决定要不要接着说；这次唤醒本身不会发送消息。',
+      qq_interruption: interruptionPrompt(active.recovery),
     }[run.trigger];
     return `【自主插件触发；这是系统记录的触发信息，不是任何人发来的消息】\n本轮ID：${active.id}\n触发原因：${triggerReason}\n${intentSnapshot(intents, this.now())}\n${this.config.motivation}\n${this.config.allowSelfWake ? '用户允许你通过 autonomy_schedule 自行安排下一次唤醒；先 get 了解当前安排和睡眠限制。按需要设置，不必每轮安排；普通随机唤醒仍独立运行。' : '用户尚未允许你自行安排唤醒，不要宣称已经设定。'}\n你沿用当前会话的人格、记忆和已经启用的能力。普通意图只是可选方向；没有意图也能行动。需要时使用 autonomy_intents 读取或维护意图；不把想法当成已经发生的事。对他人的约定与普通念头分开；明确放弃须有实际理由，对已经答应的事还须向对方解释。\n如果选择发消息，使用已启用的平台工具并核对可信目标与实际回执；本轮最终文字不会自动转发给任何人。不要虚构尚未安装的能力。若发送被权限或能力限制阻止，说明真实受阻原因即可；受阻本身不表示你已决定放弃约定，不必删除意图才能结束本轮。工具返回 retryAutomatically=false 或明确要求人工核对时，本轮不得再次尝试同一动作，使用相同 messageId 也算重试，更不能换 ID、改写内容或改走别的发送方式重试。不要把工具调用成功当作业务成功，只有真实成功回执才能完成相应意图；未确认的结果保留未完成。区分投递事实和对方态度：若回执明确说明未发送或发送失败，只能记录该技术事实；若仅有 confirmed=false、delivery_failed 或超时等不完整结果，则保留送达未知，不能猜成已送达或必然未送达。retryAutomatically=false 只控制重试，不证明送达状态。发送成功也不代表对方已读；没有独立证据，不得由失败、送达未知或未回复推断对方不想理你、拒绝交流或故意冷落，历史中类似推测也不当作事实沿用。技术受阻不强制你等对方开口，不自动补发旧消息；之后仍可自行判断新的独立行动，但不能借新一轮、新 ID 或改写内容变相重发待核对的同一动作。不相关且不依赖该结果的行动仍可自行判断；若只剩受阻事项，调用 autonomy_finish 说明受阻与本次决定后结束。只有工具未禁止重试、且明确指出参数校验未通过时，才按缺失字段修正一次；不要重复相同的无效调用。\n判断结束时必须调用 autonomy_finish，runId 填 ${active.id}，decision 为 no_action 或 acted，reason 写实际决定与简短理由。no_action 同样是正常的选择，不必为了结束而找事情做。调用结束工具后本轮停止；它会记录真实经历，不需要再输出助手聊天回复。`;
   }
@@ -615,6 +656,12 @@ export class Autonomy {
     try {
       // An explicit cancel consumes the queued opportunity, leaving its thought open.
       for (const job of qqReviews) await this.qq.claim(job.session);
+      for (const job of jobs) {
+        if (!job.started && job.recovery) {
+          const { accountId, deliveryId, fact } = job.recovery;
+          await this.interruptions.claimRecovery(job.session, accountId, deliveryId, fact);
+        }
+      }
       for (const job of schedules) await this.updateState(job.session, state => {
         if (state.selfWake?.id === job.run.selfWake!.id) {
           state.selfWake = null; state.selfWakeVersion = (state.selfWakeVersion ?? 0) + 1;

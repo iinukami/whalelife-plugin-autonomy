@@ -18,8 +18,11 @@ interface Item extends QQDeliveryRef {
 type Key = { sessionId: string; deliveryId: string };
 type Operation = Key & { expectedRevision: string };
 interface Failure { status: 'blocked'; confirmed: false; reason: string }
+interface QQStatus { state?: string; binding?: { state?: string; sessionId?: string } }
 interface QQ {
   textDeliveryApiVersion: string; textDeliveryResumeSupported: boolean;
+  getSelfId?(): string | null | Promise<string | null>;
+  status?(): QQStatus | Promise<QQStatus>;
   listTextDeliveries(input: { sessionId: string; limit: number; cursor?: string }): Promise<Failure | { status: 'ok'; items: Item[]; nextCursor?: string }>;
   textDelivery(input: Key): Promise<Failure | { status: 'ok'; item: Item }>;
   resumeTextDelivery(input: Operation, options: { signal: AbortSignal }): Promise<ActionResult>;
@@ -33,6 +36,8 @@ type Candidate = { intentId: string; item: Item; reviewed?: string; attempted?: 
 const blocked = (reason: string): Failure => ({ status: 'blocked', confirmed: false, reason });
 const id = (s: unknown): s is string => typeof s === 'string' && s.length > 0 && s.length <= 200 && !/[\x00-\x1f\x7f]/u.test(s);
 const refKey = (ref: QQDeliveryRef) => JSON.stringify([ref.accountId, ref.deliveryId]);
+const qqAccount = (value: unknown): value is string => typeof value === 'string' && /^[1-9]\d{4,19}$/.test(value);
+type RecoveryWindow = { offlineAt: number; onlineAt: number };
 const sameRef = (a: QQDeliveryRef, b: QQDeliveryRef) => a.accountId === b.accountId && a.deliveryId === b.deliveryId;
 const abandonReasons = {
   topic_changed: '对方已经转到新话题，继续原话会打断现在的交流。',
@@ -77,6 +82,8 @@ export class QqContinuation {
   private tail: Promise<unknown> = Promise.resolve();
   private snapshot?: { session: string; generation: number; next: number; candidates: Candidate[] };
   private generation = 0;
+  private link?: { account: string; offlineAt: number | null; windows: RecoveryWindow[] };
+  private connection?: { session: string; account: string | null; next: number };
   private refreshPosted = false;
   private lastWarning = -Infinity;
   private pendingClosures = new Map<string, { session: string; ref: QQDeliveryRef; outcome: 'sent' | 'dismissed'; keepConfirmation: boolean }>();
@@ -100,13 +107,19 @@ export class QqContinuation {
             !(['listTextDeliveries','textDelivery','resumeTextDelivery','dismissTextDelivery'] as const)
               .every(key => typeof service[key] === 'function')) return;
         this.register(binding);
-        binding.effect(() => this.ctx.on('plugin:qq:connection-changed', () => this.invalidate()));
+        binding.effect(() => this.ctx.on<{ accountId?: string; state?: string }>('plugin:qq:connection-changed', event => {
+          if (this.binding !== binding || binding.signal.aborted) return;
+          this.connection = undefined;
+          this.observeConnection(event?.accountId, event?.state);
+          this.invalidate();
+        }));
         binding.effect(() => this.ctx.on('plugin:qq:text-delivery-changed', () => this.invalidate()));
         const supportsResume = service.textDeliveryResumeSupported;
         binding.effect(() => {
           this.binding = binding; this.supportsResume = supportsResume; this.invalidate();
           return () => { if (this.binding === binding) {
             this.binding = undefined; this.snapshot = undefined; this.supportsResume = false;
+            this.link = undefined; this.connection = undefined;
             this.offline.clear(); this.recovered.clear();
           } };
         });
@@ -214,11 +227,53 @@ export class QqContinuation {
   async check(session: string) {
     const binding = this.binding;
     if (!binding || binding.signal.aborted) return;
+    if (this.connection && this.connection.session !== session) this.connection = undefined;
     await this.serial(() => this.scan(session, binding)).catch(() => {
       if (this.binding === binding && !binding.signal.aborted) {
         this.warn(); this.snapshot = { session, generation: this.generation, next: this.now() + 30_000, candidates: [] };
       }
     });
+  }
+  private observeConnection(account: unknown, state: unknown) {
+    if (!qqAccount(account) || !['online', 'disconnected', 'connecting', 'offline'].includes(String(state))) return;
+    if (this.link?.account !== account) this.link = { account, offlineAt: null, windows: [] };
+    const link = this.link;
+    if (state !== 'online') { link.offlineAt ??= this.now(); return; }
+    if (link.offlineAt === null) return;
+    link.windows.push({ offlineAt: link.offlineAt, onlineAt: this.now() });
+    if (link.windows.length > 64) link.windows.shift();
+    link.offlineAt = null;
+  }
+  recoveryWindows(account: string): readonly RecoveryWindow[] {
+    return this.link?.account === account ? this.link.windows : [];
+  }
+  async recoveryAccount(session: string, verify = false): Promise<string | null> {
+    const binding = this.binding;
+    if (!binding || binding.signal.aborted || !this.supportsResume) return null;
+    if (await this.selected() !== session) {
+      if (this.connection?.session === session) this.connection = undefined;
+      return null;
+    }
+    if (this.binding !== binding || binding.signal.aborted) return null;
+    const service = binding.service;
+    if (typeof service.getSelfId !== 'function' || typeof service.status !== 'function') return null;
+    if (!verify && this.connection?.session === session && this.connection.next > this.now()) return this.connection.account;
+    const probe = this.connection = { session, account: null as string | null, next: Infinity };
+    const read = async () => {
+      try {
+        const [account, status] = await Promise.all([service.getSelfId?.(), service.status?.()]);
+        if (await this.selected() !== session || this.connection !== probe || binding.signal.aborted || !qqAccount(account)) return null;
+        this.observeConnection(account, status?.state);
+        if (status?.state === 'online' && status.binding?.state === 'ready' && status.binding.sessionId === session) probe.account = account;
+        return probe.account;
+      } catch { return null; }
+      finally { probe.next = this.now() + (probe.account ? 30_000 : 5_000); }
+    };
+    // The scheduler only consumes the cache. Before starting a queued judgment
+    // obtain a fresh connection and binding, irrespective of the previous read.
+    const result = read();
+    if (!verify) return null;
+    return result;
   }
   private opportunities(session: string) {
     return this.snapshot?.session === session && this.supportsResume
